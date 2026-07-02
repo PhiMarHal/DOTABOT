@@ -101,6 +101,11 @@ const CFG = {
     reachSlack: 8,            // forward-only reachability slack (advance units)
     fightLockRadius: 350,     // enemy hero this close = we're in a fight, hold
 
+    // Mage kiting: physical attackers must stand still to hit us; our spells don't.
+    kiteThreatRadius: 260,    // melee/ranged hero this close -> start stepping
+    kiteGapMs: 1700,          // re-tap cadence (vertical peel is ~1.5s)
+    kiteSecureFoeFrac: 0.35,  // foe below this (and below us) -> stand and finish them
+
     // Lane command discipline
     laneHoldMs: 6_000,
     escapeSpamMs: 1_500,
@@ -268,6 +273,9 @@ let lastPickPostAt = 0;
 let lastPickId = "";
 let lastRecallAt = 0;
 let lastDbgAt = 0;
+let lastKiteAt = 0;
+let kiting = false;
+let kiteReturnLane: Lane | null = null;
 
 const hpHistory: { t: number; hp: number; maxHp: number }[] = [];
 const cd = { recall: 0, sprint: 0, stroll: 0 };
@@ -619,6 +627,8 @@ function resetRoundState() {
     cd.recall = 0; cd.sprint = 0; cd.stroll = 0;
     lastPickId = "";
     lastRecallAt = 0;
+    kiting = false;
+    kiteReturnLane = null;
 }
 
 // ----------------------------- WebSocket ---------------------------------------
@@ -925,13 +935,60 @@ function reachable(target: LaneStat, me: MeView, here: LaneStat): boolean {
     return myAdvance(target.frontline) >= myAdv(here) - CFG.reachSlack;
 }
 
-// A lane switch drops us at the target's frontline. Landing alone under the
-// enemy tower — or into their wave with zero creep cover — is a donated kill.
-function landingSafe(l: LaneStat): boolean {
+// A lane switch drops us at the target's frontline. Landing in the enemy tower's
+// shadow scales with OUR level (coached anchors: lvl<=4 needs a fat wave and no
+// hero; lvl 8 needs ~4 creeps with uninterrupted flow; lvl 14 can walk at a tower
+// alone as long as no enemy hero is inbound on that lane).
+function landingSafe(l: LaneStat, me: MeView): boolean {
     const adv = myAdvance(l.frontline);
-    if (l.enemyTowerAlive && adv > 35 && l.friendly < 4) return false; // tower shadow, no shield
-    if (l.friendly === 0 && l.enemy >= 4 && adv > 0) return false;     // alone into their wave
-    return true;
+    const towerZone = l.enemyTowerAlive && adv > 35;
+    if (!towerZone) {
+        // Only hard ban: landing utterly alone into their wave on their side.
+        return !(l.friendly === 0 && l.enemy >= 4 && adv > 0);
+    }
+    if (me.level <= 4) return l.friendly >= 8 && l.enemyHeroesHere === 0;
+    if (me.level <= 7) return l.friendly >= 6 && l.enemyHeroesHere === 0;
+    if (me.level <= 13) return l.friendly >= 4 && l.adv >= 0; // flow uninterrupted
+    return l.enemyHeroesHere === 0 || l.friendly >= 4;        // 14+: solo ok if no hero inbound
+}
+
+// ----------------------------- Mage kiting -------------------------------------
+// Physical attackers (melee/ranged) must stand still to deal damage; a moving
+// mage keeps full spell output. Human tactic: tap a vertical lane change (top if
+// in mid/bot, bot if in mid/top) for as long as melee/ranged are close — unless
+// the foe is nearly dead, in which case stand still and secure the kill.
+
+const LANE_Y: Record<Lane, number> = { top: 420, mid: 1200, bot: 1980 };
+
+async function mageKite(me: MeView): Promise<"stand" | "kited" | "wait"> {
+    const u = myUnit();
+    if (!u || !W) return "stand";
+    const ef = enemyOf(myFaction!);
+    const foes = W.units.filter((x) => x.isHero && x.faction === ef && dist(x, u) <= CFG.kiteThreatRadius);
+    if (!foes.length) return "stand";
+
+    // Nearly-dead foe below our own fraction -> stand and finish them.
+    const weakest = [...foes].sort((a, b) => hpFracOf(a) - hpFracOf(b))[0];
+    if (hpFracOf(weakest) < CFG.kiteSecureFoeFrac && hpFracOf(weakest) < hpFracOf(me)) return "stand";
+
+    // Only physical attackers care about our movement; vs pure mages, hold.
+    const physicalClose = foes.some((f) => {
+        const r = roster().find((h) => h.name === f.ownerName);
+        return !!r && r.heroClass !== "mage";
+    });
+    if (!physicalClose) return "stand";
+
+    if (!kiting) { kiting = true; kiteReturnLane = serverLane ?? currentLaneTarget; }
+    if (now() - lastKiteAt < CFG.kiteGapMs) return "wait";
+
+    // Step vertically AWAY from the nearest threat.
+    const threat = [...foes].sort((a, b) => dist(a, u) - dist(b, u))[0];
+    const cur = serverLane ?? currentLaneTarget;
+    const target = LANES.filter((l) => l !== cur)
+        .sort((a, b) => Math.abs(LANE_Y[b] - threat.y) - Math.abs(LANE_Y[a] - threat.y))[0];
+    lastKiteAt = now();
+    await commandLane(target, "kite away", { emergency: true });
+    return "kited";
 }
 
 // ----------------------------- Macro --------------------------------------------
@@ -960,6 +1017,11 @@ async function macro() {
         if (best && best.l.lane !== effLane) await commandLane(best.l.lane, `pre-set respawn (${best.score.toFixed(1)})`, { emergency: true });
         return;
     }
+
+    // Channeling recall: we're invulnerable and committed. Issue NOTHING — a lane
+    // command now would redirect the teleport, and "escape" makes no sense mid-channel.
+    // (The deliberate defend-landing steer runs outside the macro and still works.)
+    if (channelingRecall()) { dbg("channeling recall — silent"); return; }
 
     // 1) Slow-path recall (REST mode; fast path is reflex()).
     if (!live() && ready("recall")) {
@@ -992,7 +1054,15 @@ async function macro() {
             const nearBase = W!.units.filter((x) => x.faction === ef && dist(x, base) <= CFG.baseDefendRadius);
             const heroesAtBase = nearBase.filter((x) => x.isHero);
             if (heroesAtBase.length >= 1 && nearBase.length - heroesAtBase.length >= CFG.defendCreepCount) {
-                defendLane = heroesAtBase[0].lane;
+                // The real threat lane = where the attacking MASS is, not a hero's stale
+                // lane assignment. Majority vote among all attackers; geometric tiebreak.
+                const byLane = new Map<Lane, number>();
+                for (const x of nearBase) byLane.set(x.lane, (byLane.get(x.lane) ?? 0) + 1);
+                defendLane = [...byLane.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+                if (!defendLane) {
+                    const meanY = nearBase.reduce((s, x) => s + x.y, 0) / nearBase.length;
+                    defendLane = meanY < 900 ? "top" : meanY > 1500 ? "bot" : "mid";
+                }
             }
         } else {
             const atDoor = lanes.filter((l) => l.enemyHeroesHere >= 1 && myAdvance(l.frontline) <= -85 && l.enemy >= CFG.defendCreepCount);
@@ -1021,16 +1091,32 @@ async function macro() {
         }
     }
 
-    // 4) FIGHT-LOCK: an enemy hero is on us and we're not dying -> hold and swing.
+    // 4) FIGHT-LOCK / KITE: an enemy hero is on us and we're not dying.
+    //    Warrior: hold and swing. Mage: step vertically while physical attackers
+    //    chase (spells keep casting; their autos need them standing still).
     const engaged = live()
         ? enemyHeroesNearMe(CFG.fightLockRadius) >= 1
         : here.enemyHeroesHere >= 1 && hpLostOver(CFG.combatWindowMs) > 0;
-    if (engaged) { dbg("fight-lock"); return; }
+    if (engaged) {
+        if (me.heroClass === "mage" && live()) {
+            const k = await mageKite(me);
+            if (k !== "stand") return; // kited or waiting for the next step
+        }
+        dbg("fight-lock");
+        return;
+    }
+    // Threat gone: snap back to the lane we were holding before the kite dance.
+    if (kiting) {
+        kiting = false;
+        const back = kiteReturnLane;
+        kiteReturnLane = null;
+        if (back && back !== effLane) { await commandLane(back, "kite return", { emergency: true }); return; }
+    }
 
     // 5) Unfair-fight utility: go where the best-biased fight / objective / feast is.
     //    Switching has a real cost (we stop pushing), so it must clearly pay AND land safely.
     const best = evals
-        .filter((e) => e.l.lane !== effLane && reachable(e.l, me, here) && landingSafe(e.l))
+        .filter((e) => e.l.lane !== effLane && reachable(e.l, me, here) && landingSafe(e.l, me))
         .sort((a, b) => b.score - a.score)[0];
     if (best && best.score > hereEval.score + CFG.switchMargin) {
         const sprint = best.urgency > 0.5 || best.score - hereEval.score > 3;
