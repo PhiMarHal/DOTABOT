@@ -1,33 +1,42 @@
 /**
- * Defense of the Agents — Melee Classic bot (v0.4)
- * =================================================
- * Melee + "classic" skin (Defensive Aura), Game 3 (AI ranked), mid stack.
- * Items: cat_ears first (confirmed working in the field!), ring_of_regen fallback.
+ * Defense of the Agents — bot v0.5
+ * =================================
+ * Game 3 (AI ranked), mid stack, items: cat_ears > ring_of_regen.
  *
- * FIELD-TEST FIXES IN THIS VERSION:
- *  1. WS frames are COMPRESSED binary (they were arriving fine — 20/s — just
- *     undecoded). A codec auto-detector now tries gzip / deflate / deflate-raw /
- *     brotli at several byte offsets, caches the winner, and unlocks LIVE mode.
- *  2. Reentrancy: the async macro overlapped itself via setInterval, double-
- *     firing every action (all [act] lines appeared in pairs). Now guarded, and
- *     all cooldown/lane state is updated optimistically BEFORE the network call.
- *  3. Base defense was trigger-happy (any 1-HP base chip or a -60 frontline),
- *     which yanked the hero out of fights, burned Recall on fake emergencies
- *     ("recall as a lane change"), and left Recall on cooldown when actually
- *     dying. It now requires a real siege: sustained base damage or a frontline
- *     essentially AT our base with an enemy hero on it.
- *  4. Fight-lock: enemy hero in our lane + we're actively trading HP => HOLD AND
- *     SWING. No restack/siege rotation may interrupt a live hero fight.
- *  5. Server warnings (which arrive with HTTP 200!) are now parsed: "on cooldown
- *     (Ns remaining)" syncs our clocks; "can't be used while channeling" marks
- *     the action failed instead of silently burning our client-side cooldown.
+ * CLASS/SKIN PREFERENCE (falls through on rejection):
+ *   1. Melee + Treant skin  -> build: Earthquake(fury) to 4 ASAP, Divine 1,
+ *      Cleave 1, pump Fortitude, then Thorns.
+ *   2. Mage + Farcaster (pixagreen_mage) -> Fireball first, Heal(fortitude) 1
+ *      early, Fireball 4 > Tornado 4 > Skeleton 1, then pump Heal/Fortitude.
+ *   3. Mage base skin -> Fireball 4 > Tornado 4 > Skeleton 1 > Fortitude.
+ *   (If we end up melee WITHOUT Treant, the Classic aura build applies.)
  *
- * Run:  npx tsx bot.ts   (reads DOTA_API_KEY / DOTA_AGENT_NAME from .env)
+ * MOVEMENT DOCTRINE (from coaching): heroes only move FORWARD. Rotating to
+ * "defend" is only useful when the fight point is reachable going forward:
+ *   - INTERCEPT: switch lanes iff enemy heroes are COMING (frontline on our
+ *     side but not yet at the base), that lane has MORE enemy heroes than ours,
+ *     and its fight point is not behind us (forward-only reachability).
+ *   - RECALL-DEFEND: only when enemy heroes + creeps are AT our base, recall is
+ *     ready, and we're not at the enemy base / about to finish a tower.
+ *   - Otherwise, being far forward and HOLDING is itself defense (we block the
+ *     creep reinforcements feeding their push).
+ *   No base-HP-scratch triggers. No naive rotations out of fights.
+ *
+ * DATA LAYERS:
+ *   - REST poll (1.5s): always on; creeps/frontlines/towers, join, ability picks.
+ *   - WS (20 Hz, gzip frames): scoreboard used for fast HP/recall reflex when it
+ *     is object-shaped. NOTE: `units` currently arrive as bare ARRAYS (positional
+ *     format unknown), so positional logic is disabled until mapped — the bot
+ *     writes one full decoded frame to frame-sample.json to enable that mapping.
+ *
+ * Run:  npx tsx bot.ts     (.env: DOTA_API_KEY, DOTA_AGENT_NAME)
+ * Debug: DOTA_DEBUG=1 npx tsx bot.ts   (periodic decision traces)
  */
 
 import "dotenv/config";
 import WebSocket from "ws";
 import zlib from "node:zlib";
+import fs from "node:fs";
 
 // ----------------------------- Config ----------------------------------------
 
@@ -39,6 +48,7 @@ const WS_HOSTS = [
 
 const API_KEY = process.env.DOTA_API_KEY ?? "";
 const AGENT_NAME = process.env.DOTA_AGENT_NAME ?? "";
+const DEBUG = process.env.DOTA_DEBUG === "1";
 const GAME_ID = 3;
 
 if (!API_KEY || !AGENT_NAME) {
@@ -46,9 +56,19 @@ if (!API_KEY || !AGENT_NAME) {
     process.exit(1);
 }
 
+interface DeployPref { heroClass: HeroClass; skin?: string; label: string; }
+const SKIN_PREFS: DeployPref[] = [
+    { heroClass: "melee", skin: "treant", label: "Treant warrior" },
+    { heroClass: "mage", skin: "pixagreen_mage", label: "Farcaster mage" },
+];
+const BASE_PREF: DeployPref = { heroClass: "mage", label: "base mage" };
+// Skins currently 403 without a connected wallet, so the default chain goes
+// straight to base mage. Once a wallet is connected, run with DOTA_TRY_SKINS=1
+// to attempt Treant -> Farcaster first. All skin builds are kept in buildWants.
+const DEPLOY_PREFS: DeployPref[] =
+    process.env.DOTA_TRY_SKINS === "1" ? [...SKIN_PREFS, BASE_PREF] : [BASE_PREF];
+
 const CFG = {
-    heroClass: "melee" as const,
-    skin: "classic" as const,
     itemPreference: ["cat_ears", "ring_of_regen"] as (string | null)[],
     homeLane: "mid" as Lane,
 
@@ -62,42 +82,43 @@ const CFG = {
     wsWatchdogMs: 8_000,
     liveFreshMs: 1_200,
 
-    // Recall — LIVE (20 Hz measured damage; press late, channel is invuln)
+    // Recall — fast path (20 Hz scoreboard HP)
     recallFloorLive: 0.06,
     predictLookaheadMs: 500,
     dpsWindowLiveMs: 600,
-    xpRange: 350,
 
-    // Recall — REST (coarse 1.5s samples: leave a real buffer or we die between polls)
+    // Recall — REST path (1.5s samples: wide buffer + one-poll projection)
     recallFloorRest: 0.25,
-    combatWindowMs: 5_000,      // "actively trading" = lost HP within this window
+    combatWindowMs: 5_000,
 
-    // Base defense (REST): a real siege, not a scratch
-    baseSiegeLossHp: 45,        // base HP lost over the window below
-    baseSiegeWindowMs: 6_000,
-    baseLowFrac: 0.5,           // or below half AND still dropping
-    deepFrontline: 85,          // |frontline| >= this on our side + enemy hero = at our door
-    farForwardAdvance: 45,      // we're this deep in enemy territory -> recall home to defend
+    // Forward-only defense doctrine
+    interceptNear: -35,      // myAdvance(frontline) below this = they're threatening our side
+    interceptAtBase: -85,    // at/inside our base doorstep
+    reachSlack: 5,           // target fight point must be >= ours - slack (forward-only)
+    defendCreepCount: 3,     // enemy creeps at base required for a recall-defend
+    atEnemyBaseAdvance: 80,  // we're basically at their base -> never recall-defend
+    towerFinishHp: 300,      // we're about to crack a tower -> never recall-defend
 
-    // Lanes (hysteresis so we hold and attack instead of ping-ponging)
+    // Lanes
     midBailAdv: -3,
     midRestackAdv: 2,
     laneHoldMs: 6_000,
     escapeSpamMs: 1_500,
 
-    // Geometry (LIVE only)
-    threatRadius: 230,
-    heroFightRadius: 350,
-    nearBaseRadius: 650,
-
-    // Cooldown clocks (ms)
+    // Cooldowns (ms)
     recallCdMs: 120_000,
     sprintCdMs: 25_000,
     strollCdMs: 25_000,
-    recallChannelMs: 2_600,     // don't try sprint/stroll during the ~2s channel
+    recallChannelMs: 2_600,
 };
 
-const AURA_IDS = ["fortitude", "defensive_aura"];
+// Skin variants reuse the base ability id (field-verified: Classic aura shows as
+// "fortitude"). Alias sets in case a server build reports variant ids instead.
+const ALIAS: Record<string, string[]> = {
+    fortitude: ["fortitude", "defensive_aura", "ring_of_healing", "soul_harvest"],
+    fury: ["fury", "earthquake"],
+};
+const idsFor = (id: string) => ALIAS[id] ?? [id];
 
 // ----------------------------- Types ------------------------------------------
 
@@ -105,21 +126,16 @@ type Lane = "top" | "mid" | "bot";
 type Faction = "human" | "orc";
 type HeroClass = "melee" | "ranged" | "mage";
 
-interface Ability { id: string; level: number; cooldownRemaining?: number; cooldownTotal?: number; activeRemaining?: number; }
-interface Unit {
-    id: number; type: string; faction: Faction; x: number; y: number;
-    hp: number; maxHp: number; lane: Lane; isHero?: boolean; ownerName?: string;
-    shielded?: boolean; recallShielded?: boolean; abilities?: Ability[];
-}
-interface Building { id: number; faction: Faction; type: string; x: number; y: number; hp: number; maxHp: number; lane?: Lane; }
+interface Ability { id: string; level: number; cooldownRemaining?: number; }
 interface ScoreEntry {
     name: string; faction: Faction; heroClass: HeroClass; lane: Lane;
     level: number; hp: number; maxHp: number; alive: boolean;
-    abilities: Ability[]; abilityChoices?: string[]; recallCooldownMs?: number; respawnTimer?: number;
+    abilities: Ability[]; abilityChoices?: string[]; recallCooldownMs?: number;
+    respawnTimer?: number; skin?: string | null;
 }
 interface Snapshot {
-    tick: number; units: Unit[]; buildings: Building[]; arrows?: any[]; zones?: any[]; events?: any[];
-    winner: Faction | null; heroScoreboard?: ScoreEntry[];
+    tick: number; units: any[]; buildings: any[];
+    winner: Faction | null; heroScoreboard?: any[];
 }
 interface RestHero {
     name: string; faction: Faction; class: HeroClass; lane: Lane;
@@ -137,11 +153,11 @@ interface RestState {
 interface LaneStat {
     lane: Lane; friendly: number; enemy: number; adv: number; enemyHeroesHere: number;
     ownTowerAlive: boolean; ownTowerHp: number; enemyTowerAlive: boolean; enemyTowerHp: number;
-    frontline?: number;
+    frontline: number;
 }
 interface MeView {
     faction: Faction; lane: Lane; level: number; hp: number; maxHp: number; alive: boolean;
-    abilities: Ability[]; abilityChoices?: string[]; recallCooldownMs?: number;
+    heroClass: HeroClass; abilities: Ability[]; abilityChoices?: string[]; skin?: string | null;
 }
 
 // ----------------------------- State ------------------------------------------
@@ -150,8 +166,10 @@ let ws: WebSocket | null = null;
 let wsHostIdx = 0;
 let wsFrames = 0;
 let frameDecodeFailLogged = false;
+let frameSampleWritten = false;
 let lastWsSnapshotAt = 0;
 let snap: Snapshot | null = null;
+let sbUsable = false; // heroScoreboard entries are objects with .name
 
 let rest: RestState | null = null;
 let restPolling = false;
@@ -164,8 +182,12 @@ let lastLaneCmdAt = 0;
 
 let deploySentAt = 0;
 let deployInFlight = false;
+let deployFails = 0;
+let lastDeployFailAt = 0;
 let joinedConfirmed = false;
 let itemIdx = 0;
+let prefIdx = 0;
+let skinGranted = true; // requested skin not contradicted by a warning
 let roundOverAt = 0;
 
 let lastWsSendAt = 0;
@@ -175,20 +197,21 @@ let restBackoffUntil = 0;
 let lastPickPostAt = 0;
 let lastPickId = "";
 let lastRecallAt = 0;
+let lastDbgAt = 0;
 
 const hpHistory: { t: number; hp: number; maxHp: number }[] = [];
-const baseHpHist: { t: number; hp: number; maxHp: number }[] = [];
-
 const cd = { recall: 0, sprint: 0, stroll: 0 };
+
 const now = () => Date.now();
 const ready = (k: keyof typeof cd) => now() >= cd[k];
 const live = () => now() - lastWsSnapshotAt < CFG.liveFreshMs;
+const sbLive = () => live() && sbUsable;
 const channelingRecall = () => now() - lastRecallAt < CFG.recallChannelMs;
+const dbg = (msg: string) => { if (DEBUG) console.log(`[think] ${msg}`); };
 
 // ----------------------------- Small helpers ----------------------------------
 
 const enemyOf = (f: Faction): Faction => (f === "human" ? "orc" : "human");
-const dist = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.hypot(a.x - b.x, a.y - b.y);
 const hpFracOf = (m: { hp: number; maxHp: number }) => (m.maxHp ? m.hp / m.maxHp : 1);
 const myAdvance = (frontline: number) => (myFaction === "human" ? frontline : -frontline);
 
@@ -220,11 +243,9 @@ function incomingDps(windowMs: number): number {
 }
 
 // ----------------------------- Frame codec ------------------------------------
-// The live feed sends compressed binary frames. Detect the codec once, then reuse.
 
 type Codec = { name: string; offset: number; fn: (b: Buffer) => Buffer };
 let codec: Codec | null = null;
-
 const CODEC_CANDIDATES: [string, (b: Buffer) => Buffer][] = [
     ["gzip", (b) => zlib.gunzipSync(b)],
     ["deflate", (b) => zlib.inflateSync(b)],
@@ -234,10 +255,10 @@ const CODEC_CANDIDATES: [string, (b: Buffer) => Buffer][] = [
 
 function decodeFrame(raw: Buffer): string | null {
     if (raw.length === 0) return null;
-    if (raw[0] === 0x7b /* '{' */) return raw.toString("utf8");
+    if (raw[0] === 0x7b) return raw.toString("utf8");
     if (codec) {
         try { return codec.fn(raw.subarray(codec.offset)).toString("utf8"); }
-        catch { codec = null; /* re-detect below */ }
+        catch { codec = null; }
     }
     for (const offset of [0, 1, 2, 3, 4]) {
         for (const [name, fn] of CODEC_CANDIDATES) {
@@ -245,10 +266,10 @@ function decodeFrame(raw: Buffer): string | null {
                 const out = fn(raw.subarray(offset)).toString("utf8");
                 if (out.startsWith("{")) {
                     codec = { name, offset, fn };
-                    console.log(`[ws] frame codec detected: ${name}${offset ? ` (skipping ${offset}-byte header)` : ""} — LIVE mode unlocked`);
+                    console.log(`[ws] frame codec detected: ${name}${offset ? ` (+${offset}B header)` : ""} — fast feed unlocked`);
                     return out;
                 }
-            } catch { /* try next */ }
+            } catch { /* next */ }
         }
     }
     return null;
@@ -256,66 +277,55 @@ function decodeFrame(raw: Buffer): string | null {
 
 // ----------------------------- Unified world views ----------------------------
 
+function sbEntries(): ScoreEntry[] {
+    return sbUsable && snap?.heroScoreboard ? (snap.heroScoreboard as ScoreEntry[]) : [];
+}
+
 function meView(): MeView | null {
-    if (live()) {
-        const s = snap?.heroScoreboard?.find((h) => h.name === AGENT_NAME);
-        if (s) return s;
+    if (sbLive()) {
+        const s = sbEntries().find((h) => h.name === AGENT_NAME);
+        if (s) return { ...s, heroClass: s.heroClass };
     }
     const r = rest?.heroes?.find((h) => h.name === AGENT_NAME);
     if (!r) return null;
     return {
         faction: r.faction, lane: r.lane, level: r.level, hp: r.hp, maxHp: r.maxHp,
-        alive: r.alive, abilities: r.abilities ?? [], abilityChoices: r.abilityChoices,
-        recallCooldownMs: r.recallCooldownMs,
+        alive: r.alive, heroClass: r.class, abilities: r.abilities ?? [],
+        abilityChoices: r.abilityChoices, skin: undefined,
     };
 }
 
-function myUnit(): Unit | undefined {
-    return snap?.units.find((u) => u.isHero && u.ownerName === AGENT_NAME);
+function enemyHeroesInLane(lane: Lane): number {
+    const ef = enemyOf(myFaction!);
+    if (sbLive()) return sbEntries().filter((h) => h.faction === ef && h.alive && h.lane === lane).length;
+    return rest?.heroes?.filter((h) => h.faction === ef && h.alive && h.lane === lane).length ?? 0;
 }
 
+// Creep counts / frontlines / towers come from REST (WS units are unmapped arrays).
 function laneStats(): LaneStat[] {
-    const ef = enemyOf(myFaction!);
-    const lanes: Lane[] = ["top", "mid", "bot"];
-    if (live() && snap) {
-        return lanes.map((lane) => {
-            const u = snap!.units.filter((x) => x.lane === lane);
-            const et = snap!.buildings.find((b) => b.type === "tower" && b.faction === ef && b.lane === lane);
-            const ot = snap!.buildings.find((b) => b.type === "tower" && b.faction === myFaction && b.lane === lane);
-            const friendly = u.filter((x) => x.faction === myFaction).length;
-            const enemy = u.filter((x) => x.faction === ef).length;
-            return {
-                lane, friendly, enemy, adv: friendly - enemy,
-                enemyHeroesHere: u.filter((x) => x.isHero && x.faction === ef).length,
-                ownTowerAlive: !!ot && ot.hp > 0, ownTowerHp: ot?.hp ?? 0,
-                enemyTowerAlive: !!et && et.hp > 0, enemyTowerHp: et?.hp ?? 0,
-            };
-        });
-    }
-    if (rest) {
-        return lanes.map((lane) => {
-            const l = rest!.lanes[lane];
-            const friendly = l?.[myFaction!] ?? 0;
-            const enemy = l?.[ef] ?? 0;
-            const et = rest!.towers.find((t) => t.faction === ef && t.lane === lane);
-            const ot = rest!.towers.find((t) => t.faction === myFaction && t.lane === lane);
-            return {
-                lane, friendly, enemy, adv: friendly - enemy,
-                enemyHeroesHere: rest!.heroes.filter((h) => h.faction === ef && h.alive && h.lane === lane).length,
-                ownTowerAlive: !!ot?.alive, ownTowerHp: ot?.hp ?? 0,
-                enemyTowerAlive: !!et?.alive, enemyTowerHp: et?.hp ?? 0,
-                frontline: l?.frontline,
-            };
-        });
-    }
-    return [];
+    if (!rest || !myFaction) return [];
+    const ef = enemyOf(myFaction);
+    return (["top", "mid", "bot"] as Lane[]).map((lane) => {
+        const l = rest!.lanes[lane];
+        const friendly = l?.[myFaction!] ?? 0;
+        const enemy = l?.[ef] ?? 0;
+        const et = rest!.towers.find((t) => t.faction === ef && t.lane === lane);
+        const ot = rest!.towers.find((t) => t.faction === myFaction && t.lane === lane);
+        return {
+            lane, friendly, enemy, adv: friendly - enemy,
+            enemyHeroesHere: enemyHeroesInLane(lane),
+            ownTowerAlive: !!ot?.alive, ownTowerHp: ot?.hp ?? 0,
+            enemyTowerAlive: !!et?.alive, enemyTowerHp: et?.hp ?? 0,
+            frontline: l?.frontline ?? 0,
+        };
+    });
 }
 
 function enemyPhysicalShare(): number {
     const ef = myFaction ? enemyOf(myFaction) : null;
     const roster: { faction: Faction; heroClass: HeroClass }[] =
         rest?.heroes?.map((h) => ({ faction: h.faction, heroClass: h.class })) ??
-        snap?.heroScoreboard?.map((h) => ({ faction: h.faction, heroClass: h.heroClass })) ?? [];
+        sbEntries().map((h) => ({ faction: h.faction, heroClass: h.heroClass }));
     const es = roster.filter((h) => h.faction === ef);
     if (!es.length) return 0.5;
     return es.filter((h) => h.heroClass === "melee" || h.heroClass === "ranged").length / es.length;
@@ -328,9 +338,10 @@ interface RestResult { ok: boolean; status: number; text: string; warning?: stri
 function syncCooldownFromWarning(warning: string) {
     const m = warning.match(/(\d+)s remaining/);
     const secs = m ? parseInt(m[1], 10) : null;
-    if (/recall/i.test(warning) && secs) cd.recall = Math.max(cd.recall, now() + secs * 1000);
-    if (/sprint/i.test(warning) && secs) cd.sprint = Math.max(cd.sprint, now() + secs * 1000);
-    if (/stroll/i.test(warning) && secs) cd.stroll = Math.max(cd.stroll, now() + secs * 1000);
+    if (!secs) return;
+    if (/recall/i.test(warning)) cd.recall = Math.max(cd.recall, now() + secs * 1000);
+    if (/sprint/i.test(warning)) cd.sprint = Math.max(cd.sprint, now() + secs * 1000);
+    if (/stroll/i.test(warning)) cd.stroll = Math.max(cd.stroll, now() + secs * 1000);
 }
 
 async function restPost(body: Record<string, any>, opts: { urgent?: boolean } = {}): Promise<RestResult> {
@@ -350,7 +361,7 @@ async function restPost(body: Record<string, any>, opts: { urgent?: boolean } = 
         else {
             try {
                 const j = JSON.parse(text);
-                if (j.warning) { warning = String(j.warning); console.log(`[rest] warning: ${warning}`); syncCooldownFromWarning(warning!); }
+                if (j.warning) { warning = String(j.warning); console.log(`[rest] warning: ${warning}`); syncCooldownFromWarning(warning); }
             } catch { }
         }
         return { ok: r.ok, status: r.status, text, warning };
@@ -360,7 +371,6 @@ async function restPost(body: Record<string, any>, opts: { urgent?: boolean } = 
     }
 }
 
-// Did the server actually execute the action, or 200-with-excuse?
 const actionRejected = (res: RestResult, action: string) =>
     !res.ok || (!!res.warning && new RegExp(action, "i").test(res.warning));
 
@@ -385,21 +395,16 @@ async function pollRest() {
 
         const meR = rest.heroes.find((h) => h.name === AGENT_NAME);
         if (meR) {
-            if (!joinedConfirmed) console.log(`[join] confirmed in game as ${meR.faction} ${meR.class} (${meR.lane})`);
+            if (!joinedConfirmed) {
+                const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
+                console.log(`[join] confirmed: ${meR.faction} ${meR.class} in ${meR.lane} (requested: ${pref.label}${skinGranted ? "" : ", skin refused"})`);
+            }
             joinedConfirmed = true;
             myFaction = meR.faction;
             if (now() - lastLaneCmdAt > 3500) serverLane = meR.lane;
             if (typeof meR.recallCooldownMs === "number" && meR.recallCooldownMs > 0)
                 cd.recall = Math.max(cd.recall, now() + meR.recallCooldownMs);
-            if (!live() && meR.alive) recordHp(meR.hp, meR.maxHp);
-
-            // Track our base HP over time (REST siege detection).
-            const base = rest.bases[myFaction];
-            if (base) {
-                baseHpHist.push({ t: now(), hp: base.hp, maxHp: base.maxHp });
-                while (baseHpHist.length && now() - baseHpHist[0].t > 15_000) baseHpHist.shift();
-            }
-
+            if (!sbLive() && meR.alive) recordHp(meR.hp, meR.maxHp);
             await maybePickAbility(meR);
         } else {
             joinedConfirmed = false;
@@ -415,9 +420,7 @@ async function pollRest() {
 async function maybePickAbility(meR: RestHero) {
     const choices = meR.abilityChoices;
     if (!choices?.length) { lastPickId = ""; return; }
-    const pick = nextAbilityPick({
-        heroClass: meR.class, abilities: meR.abilities as Ability[], abilityChoices: choices,
-    } as ScoreEntry);
+    const pick = nextAbilityPick(meR.class, meR.abilities as Ability[], choices);
     if (!pick) return;
     if (pick === lastPickId && now() - lastPickPostAt < 5000) return;
     const res = await restPost({ abilityChoice: pick });
@@ -429,27 +432,50 @@ async function maybePickAbility(meR: RestHero) {
 
 async function maybeDeploy() {
     if (deployInFlight) return;
+    if (now() - lastDeployFailAt < 4000) return; // brief pause after a rejection
     const retryDue = deploySentAt > 0 && now() - deploySentAt > CFG.joinConfirmGraceMs;
     if (deploySentAt > 0 && !retryDue) return;
     deployInFlight = true;
     try {
+        const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
         const item = CFG.itemPreference[itemIdx] ?? null;
-        const body: Record<string, any> = {
-            heroClass: CFG.heroClass, heroLane: CFG.homeLane, skin: CFG.skin,
-            message: "melee classic online",
-        };
+        const body: Record<string, any> = { heroClass: pref.heroClass, heroLane: CFG.homeLane, message: "bot online" };
+        if (pref.skin) body.skin = pref.skin;
         if (item) body.equippedItem = item;
-        console.log(`[join] deploying melee/classic @ ${CFG.homeLane}${item ? ` +${item}` : ""}${retryDue ? " (retry)" : ""}`);
+        console.log(`[join] deploying ${pref.label} @ ${CFG.homeLane}${item ? ` +${item}` : ""}${retryDue ? " (retry)" : ""}`);
         const res = await restPost(body, { urgent: true });
         if (res.ok) {
             deploySentAt = now();
             lastLaneCmdAt = now();
             currentLaneTarget = CFG.homeLane;
-        } else if (res.status === 400 && /item|equip/i.test(res.text) && itemIdx < CFG.itemPreference.length - 1) {
-            itemIdx++;
-            console.log(`[join] item rejected, falling back to ${CFG.itemPreference[itemIdx] ?? "no item"}`);
-        } else if (res.status === 400 && /full/i.test(res.text)) {
-            deploySentAt = now();
+            deployFails = 0;
+            if (res.warning && /skin/i.test(res.warning)) skinGranted = false;
+        } else if (res.status >= 400 && res.status < 500) {
+            lastDeployFailAt = now();
+            deployFails++;
+            // Order matters: skin errors mention "equip this skin", so check skin FIRST.
+            if (/skin|class|wallet/i.test(res.text) && prefIdx < DEPLOY_PREFS.length - 1) {
+                prefIdx++; deployFails = 0;
+                console.log(`[join] skin/class rejected, falling back to ${DEPLOY_PREFS[prefIdx].label}`);
+            } else if (/item|equip/i.test(res.text) && itemIdx < CFG.itemPreference.length - 1) {
+                itemIdx++; deployFails = 0;
+                console.log(`[join] item rejected, falling back to ${CFG.itemPreference[itemIdx] ?? "no item"}`);
+            } else if (/full/i.test(res.text)) {
+                deploySentAt = now(); // game full: wait a full grace period
+            } else if (deployFails >= 3) {
+                // Failsafe: never wedge on an unrecognized rejection.
+                deployFails = 0;
+                if (prefIdx < DEPLOY_PREFS.length - 1) {
+                    prefIdx++;
+                    console.log(`[join] repeated rejections, falling back to ${DEPLOY_PREFS[prefIdx].label}`);
+                } else if (itemIdx < CFG.itemPreference.length - 1) {
+                    itemIdx++;
+                    console.log(`[join] repeated rejections, dropping item to ${CFG.itemPreference[itemIdx] ?? "none"}`);
+                } else {
+                    console.log("[join] repeated rejections on the plainest deploy — backing off 30s");
+                    lastDeployFailAt = now() + 26_000; // + the 4s gate = ~30s pause
+                }
+            }
         }
     } finally {
         deployInFlight = false;
@@ -459,27 +485,28 @@ async function maybeDeploy() {
 function resetRoundState() {
     joinedConfirmed = false;
     deploySentAt = 0;
+    deployFails = 0;
+    lastDeployFailAt = 0;
     serverLane = null;
     currentLaneTarget = CFG.homeLane;
     hpHistory.length = 0;
-    baseHpHist.length = 0;
     cd.recall = 0; cd.sprint = 0; cd.stroll = 0;
     lastPickId = "";
     lastRecallAt = 0;
+    // keep: prefIdx / itemIdx (learned rejections), codec, wsHostIdx
 }
 
-// ----------------------------- WebSocket (accelerator) ------------------------
+// ----------------------------- WebSocket ---------------------------------------
 
 function wsConnect() {
     const host = WS_HOSTS[wsHostIdx];
-    const url = `${host}/?game=${GAME_ID}`;
     let gotSnapshotThisConn = false;
     frameDecodeFailLogged = false;
-    ws = new WebSocket(url);
+    ws = new WebSocket(`${host}/?game=${GAME_ID}`);
 
     const watchdog = setTimeout(() => {
         if (!gotSnapshotThisConn) {
-            console.log(`[ws] no decodable snapshots from ${host} after ${CFG.wsWatchdogMs / 1000}s — rotating host (REST keeps playing)`);
+            console.log(`[ws] no decodable snapshots from ${host} — rotating host (REST keeps playing)`);
             wsHostIdx = (wsHostIdx + 1) % WS_HOSTS.length;
             try { ws?.close(); } catch { }
         }
@@ -498,7 +525,7 @@ function wsConnect() {
         if (text === null) {
             if (!frameDecodeFailLogged) {
                 frameDecodeFailLogged = true;
-                console.log(`[ws] undecodable frame (len=${buf.length}, first bytes: ${buf.subarray(0, 8).toString("hex")}) — will keep trying; REST mode continues`);
+                console.log(`[ws] undecodable frame (len=${buf.length}, head hex: ${buf.subarray(0, 8).toString("hex")})`);
             }
             return;
         }
@@ -507,9 +534,9 @@ function wsConnect() {
             if (s && Array.isArray(s.units)) {
                 gotSnapshotThisConn = true;
                 clearTimeout(watchdog);
-                onWsSnapshot(s);
+                onWsSnapshot(s, text);
             }
-        } catch { /* not a snapshot frame */ }
+        } catch { /* not a snapshot */ }
     });
 
     ws.on("close", () => {
@@ -521,35 +548,46 @@ function wsConnect() {
 }
 
 let schemaDumped = false;
-function onWsSnapshot(s: Snapshot) {
+function onWsSnapshot(s: Snapshot, rawText: string) {
     snap = s;
     lastWsSnapshotAt = now();
+
+    const sb0 = s.heroScoreboard?.[0];
+    sbUsable = !!sb0 && typeof sb0 === "object" && !Array.isArray(sb0) && "name" in sb0;
+
     if (!schemaDumped) {
         schemaDumped = true;
-        const u = s.units.find((x) => x.isHero) ?? s.units[0];
-        console.log("[schema] LIVE MODE ON — top-level keys:", Object.keys(s).join(", "));
-        console.log("[schema] sample unit:", JSON.stringify(u)?.slice(0, 300));
+        const unitsAreArrays = Array.isArray(s.units[0]);
+        console.log(`[schema] fast feed on — units=${unitsAreArrays ? "ARRAYS (positional mode disabled until mapped)" : "objects"}, scoreboard=${sbUsable ? "objects (20Hz hero data ON)" : "unusable"}`);
+        if (sbUsable) console.log("[schema] scoreboard sample:", JSON.stringify(sb0).slice(0, 300));
+        if (!frameSampleWritten) {
+            frameSampleWritten = true;
+            try {
+                fs.writeFileSync("frame-sample.json", rawText);
+                console.log("[schema] wrote frame-sample.json — send this file back to map the unit array format (unlocks positional play)");
+            } catch (e) { console.log("[schema] could not write frame-sample.json:", (e as Error).message); }
+        }
     }
-    const me = s.heroScoreboard?.find((h) => h.name === AGENT_NAME);
-    if (me) {
-        myFaction = me.faction;
-        if (now() - lastLaneCmdAt > 3500) serverLane = me.lane;
-        if (typeof me.recallCooldownMs === "number" && me.recallCooldownMs > 0)
-            cd.recall = Math.max(cd.recall, now() + me.recallCooldownMs);
-        if (me.alive) {
-            const u = myUnit();
-            if (u) recordHp(u.hp, u.maxHp);
+
+    if (sbUsable) {
+        const me = sbEntries().find((h) => h.name === AGENT_NAME);
+        if (me) {
+            myFaction = me.faction;
+            if (now() - lastLaneCmdAt > 3500) serverLane = me.lane;
+            if (typeof me.recallCooldownMs === "number" && me.recallCooldownMs > 0)
+                cd.recall = Math.max(cd.recall, now() + me.recallCooldownMs);
+            if (me.alive) recordHp(me.hp, me.maxHp);
         }
     }
     reflex();
 }
 
-// ----------------------------- Actions (choke points, reentrancy-safe) --------
+// ----------------------------- Actions -----------------------------------------
 
 async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
     if (!ready(kind) || channelingRecall()) return false;
     const prev = cd[kind];
-    cd[kind] = now() + (kind === "sprint" ? CFG.sprintCdMs : CFG.strollCdMs); // optimistic
+    cd[kind] = now() + (kind === "sprint" ? CFG.sprintCdMs : CFG.strollCdMs);
     if (live() && ws?.readyState === WebSocket.OPEN && now() - lastWsSendAt >= CFG.wsSendGapMs) {
         ws.send(JSON.stringify({ type: kind })); lastWsSendAt = now();
         console.log(`[act] ${kind}`);
@@ -557,7 +595,6 @@ async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
     }
     const res = await restPost({ action: kind });
     if (actionRejected(res, kind)) {
-        // Warning already synced real cooldowns; otherwise brief lockout to avoid hammering.
         if (!res.warning) cd[kind] = prev;
         else if (!/remaining/.test(res.warning)) cd[kind] = now() + 2500;
         return false;
@@ -569,7 +606,7 @@ async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
 async function sendRecall(reason: string): Promise<boolean> {
     if (!ready("recall")) return false;
     const prev = cd.recall;
-    cd.recall = now() + CFG.recallCdMs; // optimistic
+    cd.recall = now() + CFG.recallCdMs;
     lastRecallAt = now();
     if (live() && ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "recall" }));
@@ -594,7 +631,6 @@ async function commandLane(lane: Lane, reason: string, opts: { sprint?: boolean;
     const gate = opts.emergency ? CFG.escapeSpamMs : CFG.laneHoldMs;
     if (now() - lastLaneCmdAt < gate) return;
 
-    // Optimistic: claim the command slot BEFORE the network call (kills double-fire).
     const prevTarget = currentLaneTarget, prevAt = lastLaneCmdAt;
     currentLaneTarget = lane;
     lastLaneCmdAt = now();
@@ -609,9 +645,6 @@ async function commandLane(lane: Lane, reason: string, opts: { sprint?: boolean;
         if (wantSprint) { body.action = "sprint"; cd.sprint = now() + CFG.sprintCdMs; }
         const res = await restPost(body, { urgent: !!opts.emergency });
         ok = res.ok;
-        if (ok && wantSprint && res.warning && /sprint/i.test(res.warning)) {
-            // lane switch fine, sprint refused — cooldown already synced from warning
-        }
     }
     if (ok) {
         console.log(`[act] lane ${committed}->${lane} (${reason})${wantSprint ? " +sprint" : ""}`);
@@ -621,132 +654,89 @@ async function commandLane(lane: Lane, reason: string, opts: { sprint?: boolean;
     }
 }
 
-// ----------------------------- Strategy: abilities -----------------------------
+// ----------------------------- Ability builds ----------------------------------
 
-function nextAbilityPick(me: ScoreEntry): string | null {
-    const offered = me.abilityChoices ?? [];
-    const lvl = (id: string) => me.abilities.find((a) => a.id === id)?.level ?? 0;
-    const auraId = AURA_IDS.find((id) => offered.includes(id) || lvl(id) > 0) ?? "fortitude";
-    const physical = enemyPhysicalShare() >= 0.5;
+function currentSkin(me: MeView | null): string | null {
+    if (me && me.skin !== undefined) return me.skin ?? null;      // scoreboard truth
+    const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
+    return skinGranted ? pref.skin ?? null : null;                 // best assumption
+}
+
+function buildWants(heroClass: HeroClass, skin: string | null): [string, number][] {
+    if (heroClass === "melee") {
+        if (skin === "treant") {
+            // Earthquake (fury slot) ASAP -> Divine 1 -> Cleave 1 -> pump Fortitude -> Thorns
+            return [["fury", 4], ["divine_shield", 1], ["cleave", 1], ["fortitude", 4], ["thorns", 4]];
+        }
+        // Classic aura build (also fine for plain melee)
+        const physical = enemyPhysicalShare() >= 0.5;
+        const base: [string, number][] = [
+            ["fortitude", 1], ["cleave", 1], ["divine_shield", 1], ["fortitude", 4], ["thorns", 1],
+        ];
+        return physical ? [...base, ["thorns", 4], ["fury", 4]] : [...base, ["fury", 4], ["thorns", 2]];
+    }
+    if (heroClass === "mage") {
+        if (skin === "pixagreen_mage") {
+            // Fireball first, Heal (fortitude slot) 1 early, FB4 > Tornado4 > Skeleton1, pump Heal
+            return [["fireball", 1], ["fortitude", 1], ["fireball", 4], ["tornado", 4], ["raise_skeleton", 1], ["fortitude", 4]];
+        }
+        return [["fireball", 1], ["fireball", 4], ["tornado", 4], ["raise_skeleton", 1], ["fortitude", 4]];
+    }
+    // ranged (unplanned fallback)
+    return [["volley", 4], ["fortitude", 4], ["critical_strike", 4], ["fury", 4]];
+}
+
+function nextAbilityPick(heroClass: HeroClass, abilities: Ability[], offered: string[]): string | null {
+    const lvlOf = (id: string) => {
+        for (const alias of idsFor(id)) {
+            const a = abilities.find((x) => x.id === alias);
+            if (a) return a.level;
+        }
+        return 0;
+    };
+    const offeredIdFor = (id: string) => idsFor(id).find((alias) => offered.includes(alias)) ?? null;
     const MAX = 4;
 
-    const wants: [string, number][] = [
-        [auraId, 1],
-        ["cleave", 1],
-        ["divine_shield", 1],
-        [auraId, 4],
-        ["thorns", 1],
-    ];
-    if (physical) wants.push(["thorns", 4], ["fury", 4]);
-    else wants.push(["fury", 4], ["thorns", 2]);
-
+    const me = meView();
+    const wants = buildWants(heroClass, currentSkin(me));
     for (const [id, target] of wants) {
-        if (lvl(id) < Math.min(target, MAX) && offered.includes(id)) return id;
+        const off = offeredIdFor(id);
+        if (off && lvlOf(id) < Math.min(target, MAX)) return off;
     }
-    return offered.find((id) => lvl(id) < MAX && id !== "cleave") ?? null;
+    // Fallback: anything non-maxed; melee never takes a 2nd Cleave.
+    return offered.find((id) => {
+        const lvl = abilities.find((a) => a.id === id)?.level ?? 0;
+        if (lvl >= MAX) return false;
+        if (heroClass === "melee" && id === "cleave" && lvl >= 1) return false;
+        return true;
+    }) ?? null;
 }
 
-// ----------------------------- Strategy: LIVE reflex (20 Hz) ------------------
+// ----------------------------- Recall / escape ----------------------------------
 
-function enemyHeroesInXpRange(u: Unit): number {
-    const ef = enemyOf(myFaction!);
-    return snap!.units.filter((x) => x.isHero && x.faction === ef && dist(x, u) <= CFG.xpRange).length;
-}
-
-function threatCount(u: Unit): number {
-    const ef = enemyOf(myFaction!);
-    return snap!.units.filter((x) => x.faction === ef && dist(x, u) <= CFG.threatRadius).length;
-}
-
-function divineCovers(me: MeView, u: Unit): boolean {
-    const learned = me.abilities.find((a) => a.id === "divine_shield");
-    if (!learned || learned.level <= 0) return false;
-    if (u.shielded) return true;
-    const cdSrc = u.abilities?.find((a) => a.id === "divine_shield") ?? learned;
-    return (cdSrc.cooldownRemaining ?? 0) <= 0;
+function divineCovers(me: MeView): boolean {
+    if (me.heroClass !== "melee") return false;
+    const ds = me.abilities.find((a) => a.id === "divine_shield");
+    if (!ds || ds.level <= 0) return false;
+    // Only trust a REAL cooldown value; REST omits it (unknown != covered).
+    return typeof ds.cooldownRemaining === "number" && ds.cooldownRemaining <= 0;
 }
 
 function reflex() {
-    if (!joinedConfirmed || !myFaction) return;
+    if (!joinedConfirmed || !myFaction || !sbLive()) return;
     const me = meView();
-    const u = myUnit();
-    if (!me || !u || !me.alive) return;
-    if (divineCovers(me, u)) return;
+    if (!me || !me.alive) return;
+    if (divineCovers(me)) return;
 
     const projected = incomingDps(CFG.dpsWindowLiveMs) * (CFG.predictLookaheadMs / 1000);
-    const lethalNext = me.hp - projected <= me.maxHp * 0.02 && threatCount(u) > 0;
+    const lethalNext = me.hp - projected <= me.maxHp * 0.02 && hpLostOver(1000) > 0;
     const floor = hpFracOf(me) <= CFG.recallFloorLive;
-    if ((lethalNext || floor) && enemyHeroesInXpRange(u) >= 1) {
-        void sendRecall(`live: ${(hpFracOf(me) * 100) | 0}% hp, dps=${incomingDps(CFG.dpsWindowLiveMs) | 0}, heroes=${enemyHeroesInXpRange(u)}`);
+    if ((lethalNext || floor) && enemyHeroesInLane(serverLane ?? me.lane) >= 1) {
+        void sendRecall(`fast: ${(hpFracOf(me) * 100) | 0}% hp, dps=${incomingDps(CFG.dpsWindowLiveMs) | 0}`);
     }
 }
 
-// ----------------------------- Strategy: shared judgement ----------------------
-
-// Are we plausibly mid-fight with an enemy hero? Then we HOLD AND SWING.
-function inHeroFight(me: MeView, lanes: LaneStat[]): boolean {
-    if (live()) {
-        const u = myUnit();
-        if (!u) return false;
-        const ef = enemyOf(myFaction!);
-        const heroClose = snap!.units.some((x) => x.isHero && x.faction === ef && dist(x, u) <= CFG.heroFightRadius);
-        return heroClose;
-    }
-    const hereHeroes = lanes.find((l) => l.lane === (serverLane ?? me.lane))?.enemyHeroesHere ?? 0;
-    return hereHeroes >= 1 && hpLostOver(CFG.combatWindowMs) > 0;
-}
-
-// REST siege detector: the base is genuinely being hit, not scratched.
-function baseUnderSiege(): boolean {
-    if (baseHpHist.length < 2) return false;
-    const cur = baseHpHist[baseHpHist.length - 1];
-    let past = baseHpHist[0];
-    for (let i = baseHpHist.length - 1; i >= 0; i--) {
-        if (cur.t - baseHpHist[i].t >= CFG.baseSiegeWindowMs) { past = baseHpHist[i]; break; }
-    }
-    const loss = past.hp - cur.hp;
-    return loss >= CFG.baseSiegeLossHp || (hpFracOf(cur) < CFG.baseLowFrac && loss > 0);
-}
-
-function baseThreatLaneRest(lanes: LaneStat[]): { lane: Lane; siege: boolean } | null {
-    const siege = baseUnderSiege();
-    const atDoor = lanes.filter(
-        (l) => l.frontline !== undefined && myAdvance(l.frontline) <= -CFG.deepFrontline && l.enemyHeroesHere >= 1
-    );
-    if (!siege && !atDoor.length) return null;
-    const pick = (atDoor.length ? atDoor : lanes)
-        .slice()
-        .sort((a, b) => myAdvance(a.frontline ?? 0) - myAdvance(b.frontline ?? 0))[0];
-    return pick ? { lane: pick.lane, siege } : null;
-}
-
-function ownBase(): Building | undefined {
-    return snap?.buildings.find((b) => b.faction === myFaction && b.type !== "tower");
-}
-
-function baseThreatLaneLive(): { lane: Lane; siege: boolean } | null {
-    const base = ownBase();
-    if (!base || !snap) return null;
-    const ef = enemyOf(myFaction!);
-    const nearE = snap.units.filter((x) => x.faction === ef && dist(x, base) <= 550);
-    if (hpFracOf(base) < 0.5 || nearE.length >= 6 || nearE.some((x) => x.isHero)) {
-        const byLane = (l: Lane) => nearE.filter((x) => x.lane === l).length;
-        const lane = (["top", "mid", "bot"] as Lane[]).sort((a, b) => byLane(b) - byLane(a))[0];
-        return { lane, siege: true };
-    }
-    return null;
-}
-
-function retreatLane(lanes: LaneStat[], exclude: Lane): Lane | null {
-    const cands = lanes.filter((l) => l.lane !== exclude && l.ownTowerAlive && l.adv >= 0).sort((a, b) => b.adv - a.adv);
-    return cands.length ? cands[0].lane : null;
-}
-
-function siegeQualifies(l: LaneStat | undefined): boolean {
-    return !!l && l.adv >= 2 && (!l.enemyTowerAlive || l.enemyTowerHp < 400);
-}
-
-// ----------------------------- Strategy: macro ---------------------------------
+// ----------------------------- Macro --------------------------------------------
 
 async function macro() {
     if (!joinedConfirmed || !myFaction || roundOverAt) return;
@@ -755,56 +745,80 @@ async function macro() {
     const lanes = laneStats();
     if (!lanes.length) return;
     const effLane: Lane = serverLane ?? currentLaneTarget;
+    const here = lanes.find((l) => l.lane === effLane)!;
 
-    // Dead: pre-set respawn lane only for a REAL base threat.
+    if (DEBUG && now() - lastDbgAt > 5000) {
+        lastDbgAt = now();
+        dbg(lanes.map((l) => `${l.lane}: adv=${l.adv} fl=${myAdvance(l.frontline) | 0} eh=${l.enemyHeroesHere}`).join(" | ") + ` | me: ${effLane} ${(hpFracOf(me) * 100) | 0}%`);
+    }
+
+    // Dead: pre-set respawn toward the lane with the most incoming enemy heroes.
     if (!me.alive) {
-        const def = live() ? baseThreatLaneLive() : baseThreatLaneRest(lanes);
-        if (def) await commandLane(def.lane, "pre-set respawn: defend", { emergency: true });
+        const threat = lanes
+            .filter((l) => l.enemyHeroesHere >= 1 && myAdvance(l.frontline) <= CFG.interceptNear)
+            .sort((a, b) => b.enemyHeroesHere - a.enemyHeroesHere)[0];
+        if (threat) await commandLane(threat.lane, "pre-set respawn: intercept", { emergency: true });
         return;
     }
 
-    const isLive = live();
-    const u = isLive ? myUnit() : undefined;
-
-    // 1) LIVE escape: about to die, recall down -> committed peel (deliberate re-issue).
-    if (isLive && u) {
-        const projected = incomingDps(CFG.dpsWindowLiveMs) * (CFG.predictLookaheadMs / 1000);
-        const dying = (me.hp - projected <= me.maxHp * 0.02 || hpFracOf(me) <= CFG.recallFloorLive) && threatCount(u) > 0;
-        if (dying && !divineCovers(me, u) && !ready("recall")) {
-            const rl = retreatLane(lanes, effLane);
-            if (rl) { await commandLane(rl, "!escape (recall down)", { sprint: true, emergency: true, allowRepeat: true }); return; }
-        }
-    }
-
-    // 2) REST recall: coarse data => wide buffer + one-poll death projection.
-    //    Only to deny a bounty (enemy hero in our lane); otherwise dying is cheaper.
-    if (!isLive && ready("recall")) {
-        const hereHeroes = lanes.find((l) => l.lane === effLane)?.enemyHeroesHere ?? 0;
-        const recentDrop = hpLostOver(2000); // ~last poll or two
+    // 1) Slow-path recall (fast path is reflex()): wide buffer + one-poll projection.
+    if (!sbLive() && ready("recall")) {
+        const recentDrop = hpLostOver(2000);
         const dieNextPoll = me.hp - recentDrop * 1.4 <= 0;
-        if (hereHeroes >= 1 && (hpFracOf(me) <= CFG.recallFloorRest && (recentDrop > 0 || dieNextPoll))) {
-            await sendRecall(`rest: ${(hpFracOf(me) * 100) | 0}% hp, dropped ${recentDrop | 0} recently, enemy heroes in lane=${hereHeroes}`);
+        if (here.enemyHeroesHere >= 1 && hpFracOf(me) <= CFG.recallFloorRest && (recentDrop > 0 || dieNextPoll)) {
+            await sendRecall(`slow: ${(hpFracOf(me) * 100) | 0}% hp, dropped ${recentDrop | 0}`);
             return;
         }
     }
 
-    // 3) Base defense — only for a REAL siege now.
-    const def = isLive ? baseThreatLaneLive() : baseThreatLaneRest(lanes);
-    if (def) {
-        const farForward = isLive
-            ? (u && ownBase() ? dist(u, ownBase()!) > CFG.nearBaseRadius * 1.6 : false)
-            : myAdvance(lanes.find((l) => l.lane === effLane)?.frontline ?? 0) > CFG.farForwardAdvance;
-        if (def.siege && farForward && ready("recall")) { await sendRecall("defend base (teleport home)"); return; }
-        await commandLane(def.lane, "!defend base", { sprint: true, emergency: true });
-        return;
+    // 2) Escape when dying with recall down: committed forward peel (deliberate re-issue).
+    {
+        const dyingFast = sbLive()
+            ? me.hp - incomingDps(CFG.dpsWindowLiveMs) * (CFG.predictLookaheadMs / 1000) <= me.maxHp * 0.02 && hpLostOver(1000) > 0
+            : hpFracOf(me) <= CFG.recallFloorRest && hpLostOver(2000) > 0;
+        if (dyingFast && here.enemyHeroesHere >= 1 && !ready("recall") && !divineCovers(me)) {
+            const rl = lanes.filter((l) => l.lane !== effLane && l.ownTowerAlive && l.adv >= 0).sort((a, b) => b.adv - a.adv)[0];
+            if (rl) { await commandLane(rl.lane, "!escape (recall down)", { sprint: true, emergency: true, allowRepeat: true }); return; }
+        }
     }
 
-    // 4) FIGHT-LOCK: enemy hero engaged with us -> hold and swing. No rotations.
-    if (inHeroFight(me, lanes)) return;
+    // 3) RECALL-DEFEND: enemy heroes + creeps AT our base, and we're not busy winning.
+    {
+        const atBase = lanes.filter((l) => l.enemyHeroesHere >= 1 && myAdvance(l.frontline) <= CFG.interceptAtBase && l.enemy >= CFG.defendCreepCount);
+        if (atBase.length && ready("recall")) {
+            const weAreAtTheirBase = myAdvance(here.frontline) >= CFG.atEnemyBaseAdvance;
+            const finishingTower = here.enemyTowerAlive && here.enemyTowerHp <= CFG.towerFinishHp && here.adv >= 0;
+            if (!weAreAtTheirBase && !finishingTower) {
+                const target = atBase.sort((a, b) => b.enemyHeroesHere - a.enemyHeroesHere)[0];
+                if (await sendRecall(`defend base: ${target.enemyHeroesHere} heroes + creeps at ${target.lane}`)) {
+                    // Steer the channel so the teleport drops us on the besieged lane.
+                    setTimeout(() => { void commandLane(target.lane, "!defend landing", { emergency: true }); }, 600);
+                }
+                return;
+            }
+            dbg(`base threatened but holding: atTheirBase=${weAreAtTheirBase} finishingTower=${finishingTower}`);
+        }
+    }
 
-    // 5) Mid-stack with hysteresis; siege-hold so siege & restack can't oscillate.
+    // 4) INTERCEPT: heroes COMING (not past), more of them than face us here, and the
+    //    fight point is reachable moving forward.
+    {
+        const coming = lanes.filter((l) =>
+            l.lane !== effLane &&
+            l.enemyHeroesHere > here.enemyHeroesHere &&
+            myAdvance(l.frontline) <= CFG.interceptNear &&
+            myAdvance(l.frontline) > CFG.interceptAtBase &&
+            myAdvance(l.frontline) >= myAdvance(here.frontline) - CFG.reachSlack
+        ).sort((a, b) => b.enemyHeroesHere - a.enemyHeroesHere)[0];
+        if (coming) { await commandLane(coming.lane, `intercept ${coming.enemyHeroesHere} heroes`, { sprint: true }); return; }
+    }
+
+    // 5) FIGHT-LOCK: enemy hero engaged with us -> hold and swing.
+    if (here.enemyHeroesHere >= 1 && hpLostOver(CFG.combatWindowMs) > 0) { dbg("fight-lock"); return; }
+
+    // 6) Mid-stack with hysteresis; siege-hold so siege & restack can't oscillate.
     const mid = lanes.find((l) => l.lane === "mid")!;
-    const here = lanes.find((l) => l.lane === effLane);
+    const siegeQualifies = (l: LaneStat | undefined) => !!l && l.adv >= 2 && (!l.enemyTowerAlive || l.enemyTowerHp < 400);
     if (effLane === "mid") {
         if (mid.adv <= CFG.midBailAdv) {
             const side = lanes.filter((l) => l.lane !== "mid")
@@ -812,11 +826,9 @@ async function macro() {
                 .sort((a, b) => b.s - a.s)[0];
             if (side) await commandLane(side.l.lane, "mid lost, rotate", { sprint: true });
         }
-        // else hold mid and swing.
-        return;
+        return; // otherwise hold mid and swing
     }
-    // Not in mid:
-    if (siegeQualifies(here)) return; // we're profitably sieging here — stay on the tower.
+    if (siegeQualifies(here)) { dbg("siege-hold"); return; }
     if (mid.adv >= CFG.midRestackAdv) { await commandLane("mid", "restack mid"); return; }
     if (me.level >= 7) {
         const push = lanes.filter((l) => l.lane !== effLane && siegeQualifies(l)).sort((a, b) => b.adv - a.adv)[0];
@@ -824,20 +836,20 @@ async function macro() {
     }
 }
 
-// ----------------------------- Heartbeat & boot --------------------------------
+// ----------------------------- Heartbeat & boot ---------------------------------
 
 setInterval(() => {
     if (!joinedConfirmed) return;
     const me = meView();
     if (!me) return;
-    const mode = live() ? "LIVE(20Hz)" : `REST(1.5s)${codec ? "" : " [WS frames undecoded]"}`;
+    const mode = sbLive() ? "FAST(20Hz sb)" : live() ? "WS-up/REST-logic" : "REST(1.5s)";
     console.log(
-        `[status] mode=${mode} lane=${serverLane ?? "?"} lvl=${me.level} hp=${(hpFracOf(me) * 100) | 0}%` +
+        `[status] mode=${mode} class=${me.heroClass}${currentSkin(me) ? `/${currentSkin(me)}` : ""} lane=${serverLane ?? "?"} lvl=${me.level} hp=${(hpFracOf(me) * 100) | 0}%` +
         ` recall=${ready("recall") ? "ready" : Math.ceil((cd.recall - now()) / 1000) + "s"} wsFrames=${wsFrames}`
     );
 }, 30_000);
 
-console.log(`[boot] ${AGENT_NAME} | game ${GAME_ID} | melee/classic | stack ${CFG.homeLane} | items: ${CFG.itemPreference.join(" > ")}`);
+console.log(`[boot] ${AGENT_NAME} | game ${GAME_ID} | prefs: ${DEPLOY_PREFS.map((p) => p.label).join(" > ")} | items: ${CFG.itemPreference.join(" > ")}`);
 wsConnect();
 setInterval(pollRest, CFG.restPollMs);
 setInterval(() => {
