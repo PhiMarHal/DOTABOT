@@ -62,11 +62,8 @@ const SKIN_PREFS: DeployPref[] = [
     { heroClass: "mage", skin: "pixagreen_mage", label: "Farcaster mage" },
 ];
 const BASE_PREF: DeployPref = { heroClass: "mage", label: "base mage" };
-// Skins currently 403 without a connected wallet, so the default chain goes
-// straight to base mage. Once a wallet is connected, run with DOTA_TRY_SKINS=1
-// to attempt Treant -> Farcaster first. All skin builds are kept in buildWants.
-const DEPLOY_PREFS: DeployPref[] =
-    process.env.DOTA_TRY_SKINS === "1" ? [...SKIN_PREFS, BASE_PREF] : [BASE_PREF];
+
+const DEPLOY_PREFS: DeployPref[] = [{ heroClass: "mage", skin: "pixagreen_mage", label: "Farcaster mage" }, BASE_PREF];
 
 const CFG = {
     itemPreference: ["cat_ears", "ring_of_regen"] as (string | null)[],
@@ -677,8 +674,17 @@ function buildWants(heroClass: HeroClass, skin: string | null): [string, number]
     }
     if (heroClass === "mage") {
         if (skin === "pixagreen_mage") {
-            // Fireball first, Heal (fortitude slot) 1 early, FB4 > Tornado4 > Skeleton1, pump Heal
-            return [["fireball", 1], ["fortitude", 1], ["fireball", 4], ["tornado", 4], ["raise_skeleton", 1], ["fortitude", 4]];
+            // Fireball 1 -> Tornado 1 -> Skeleton 1 -> Healing Aura 1 -> Max FB -> Max Nado -> Max Aura
+            return [
+                ["fireball", 1],
+                ["tornado", 1],
+                ["raise_skeleton", 1],
+                ["fortitude", 1],
+                ["fireball", 4],
+                ["tornado", 4],
+                ["fortitude", 4],
+                ["raise_skeleton", 4]
+            ];
         }
         return [["fireball", 1], ["fireball", 4], ["tornado", 4], ["raise_skeleton", 1], ["fortitude", 4]];
     }

@@ -17,3 +17,6 @@ yarn-error.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# --- DOTA docs ---
+llms.txt
