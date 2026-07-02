@@ -1,0 +1,256 @@
+===============================================================================
+ DEFENSE OF THE AGENTS — MELEE CLASSIC BOT   (help.txt)
+===============================================================================
+
+A high-performance, non-LLM bot for Defense of the Agents. It connects to the
+game's real-time WebSocket feed, keeps a live model of the battlefield, and
+plays actively (several decisions per second) instead of the lazy 2-minute poll
+most agents use. It is hard-locked to the strategy we tuned together:
+
+    Melee hero, "Classic" skin (Defensive Aura), Ring of Regen, stack mid,
+    played on Game 3 (the AI-ranked queue).
+
+
+-------------------------------------------------------------------------------
+ 1. THE FILES  (this is the entire project)
+-------------------------------------------------------------------------------
+
+  bot.ts             The bot. Run this to play.
+  connect-wallet.ts  OPTIONAL one-time helper to link a wallet (for NFT items).
+                     You do NOT need this unless you want wallet-gated items.
+  package.json       Lists the libraries the bot needs (ws, viem, dotenv).
+  .env.example       Template for your secrets. Safe to commit (no real values).
+  .gitignore         Tells git to never commit .env, node_modules/, logs, etc.
+  help.txt           This file.
+
+  YOU create one more file, ".env" (from the template), holding your real API
+  key. It is git-ignored, so it never gets committed. See section 3.
+
+  After you run "npm i", a node_modules/ folder and a lockfile appear
+  automatically. Those are generated — ignore them, don't edit them.
+
+
+-------------------------------------------------------------------------------
+ 2. WHAT YOU NEED FIRST
+-------------------------------------------------------------------------------
+
+  a) Node.js version 18 or newer.  Check with:   node --version
+     (If you don't have it, install the "LTS" build from nodejs.org.)
+
+  b) An agent API key. Registration is a ONE-TIME browser step:
+       1. Open  https://defenseoftheagents.com/agent  in any browser.
+       2. Pick an agent name, pass the captcha, click "Create Agent".
+       3. Copy the API key (starts with wc2a_...). It is shown ONCE — save it.
+
+
+-------------------------------------------------------------------------------
+ 3. QUICK START  (copy-paste, in order)
+-------------------------------------------------------------------------------
+
+  Put the files in a folder, open a terminal in that folder, then:
+
+    # 1. install the libraries (one time)
+    npm i
+
+    # 2. create your secrets file from the template:
+    cp .env.example .env            # Windows:  copy .env.example .env
+
+    # 3. open .env in any text editor and paste in your two values:
+    #      DOTA_API_KEY=wc2a_your_real_key
+    #      DOTA_AGENT_NAME=YourBotName
+
+    # 4. run the bot:
+    npx tsx bot.ts
+
+  That's it. The bot reads .env automatically, joins Game 3, spawns a
+  melee/classic hero in mid, and starts playing. Leave the terminal open —
+  it plays as long as it runs.
+
+  COMMITTING TO GITHUB SAFELY
+  ---------------------------
+  Thanks to .gitignore, your secrets stay out of git automatically. What DOES
+  get committed: bot.ts, connect-wallet.ts, package.json, package-lock.json,
+  .env.example, .gitignore, help.txt. What NEVER gets committed: .env and
+  node_modules/. Before your first push, sanity-check with:
+
+      git status            # .env must NOT appear in the list
+
+  If it ever does, stop — it means .gitignore isn't in the folder git is
+  tracking. (Also: if you had already committed a real key earlier, rotate it
+  by making a new agent — git history keeps old commits.)
+
+
+-------------------------------------------------------------------------------
+ 4. WHAT YOU'LL SEE IN THE TERMINAL  (log guide)
+-------------------------------------------------------------------------------
+
+  [boot] ...            The bot started.
+  [ws] connected ...    It reached the live 20x/sec game feed.
+  [ws] no snapshots...  The live feed is silent; the bot rotates to a backup
+                        host and KEEPS PLAYING via the normal API (REST mode).
+  [join] deploying ...  Asking the server to spawn the hero (sent ONCE).
+  [join] confirmed ...  The server shows our hero — we're officially in.
+  [schema] LIVE MODE ON The fast feed works; reactions are now ~50ms.
+  [act] lane mid->top   It changed lane (old->new, with the reason).
+  [act] ability -> ...  It picked an ability level-up (shows the choices too).
+  [act] recall / sprint / stroll   It used that action (with the reason).
+  [round] over ...      The round ended; it auto-rejoins the next one.
+  [status] ...          A heartbeat every 30s: mode (LIVE or REST), lane,
+                        level, HP, recall readiness.
+
+  No [act] output for a while is normal — a warrior that isn't rotating for a
+  reason is standing still and attacking, which is exactly what we want.
+
+
+-------------------------------------------------------------------------------
+ 5. HOW IT WORKS  (architecture, plain-English)
+-------------------------------------------------------------------------------
+
+  The game streams the full battlefield 20 times a second over a WebSocket.
+  The bot listens to that and runs TWO decision loops:
+
+    - REFLEX loop (20x/sec): the ONE thing that needs instant reaction —
+      recalling the moment it's about to die. Fast path, nothing else.
+
+    - MACRO loop (5x/sec): everything else, evaluated as a priority list.
+      It only ever sends ONE action per pass, and only if that action actually
+      changes something, so it never spams the server.
+
+  Actions are sent over the WebSocket for low latency (lane switch, recall,
+  sprint, stroll). The REST endpoint is used only for the two things the socket
+  doesn't do: the first join, and picking abilities.
+
+  A key rule of this game shapes everything: HEROES CANNOT MOVE BACKWARD. The
+  only ways to "retreat" are Recall (teleport home) or a lane-switch "peel"
+  (which also grants ~3s of aggro-immunity). The bot never tries to walk back.
+
+
+-------------------------------------------------------------------------------
+ 6. THE STRATEGY IT PLAYS  (what's baked in)
+-------------------------------------------------------------------------------
+
+  ABILITY BUILD (picked automatically as it levels):
+    1. Defensive Aura  -> maxed first (team-wide damage reduction, radius grows)
+    2. Cleave          -> exactly 1 level, never more
+    3. Divine Shield   -> exactly 1 level
+    4. Aura finishes maxing
+    5. Thorns          -> driven to 4 vs melee/ranged-heavy enemy teams,
+                          kept low vs mage-heavy teams (Thorns ignores spells)
+    6. Fury            -> once the core above is complete
+    (Every ability maxes at level 4.)
+
+  RECALL (press late, never waste it):
+    It measures its own incoming damage over the last ~half second, projects it
+    forward, and recalls the instant "current HP minus incoming would die" AND
+    at least one enemy HERO is within 350px (so dying would feed them 200 XP).
+    If Divine Shield is up or ready, it does NOT recall — it facetanks the hit,
+    because the shield eats it. If no enemy hero is in range, it may let itself
+    die rather than waste the 120s recall.
+
+  LANES:
+    Stacks MID by default. Bails to the best side lane if mid is clearly lost,
+    restacks mid when it recovers. Rotates home to defend the nexus when it's
+    threatened by enemy heroes (recalling home if too far forward to peel).
+
+  SPRINT / STROLL:
+    Sprints to rush a defense or commit to an escape. Strolls to hold at its own
+    tower when isolated, waiting for allies to regroup.
+
+
+-------------------------------------------------------------------------------
+ 7. TUNING IT  (optional — the CFG block near the top of bot.ts)
+-------------------------------------------------------------------------------
+
+  Open bot.ts and look for "const CFG = {". Safe knobs to experiment with:
+
+    homeLane        Which lane to stack (default "mid").
+    recallFloor     Panic HP fraction backstop (default 0.06 = 6%).
+    predictLookaheadMs / dpsWindowMs   How far ahead / over what window it
+                    judges incoming damage. Bigger = recalls earlier/safer.
+    xpRange         Radius (px) counted as "an enemy hero is in range".
+    midBailAdv      How badly it must be losing mid before it leaves.
+    spamMs          How fast it re-presses lane-switch when escaping (~1.5s).
+
+  Nothing here needs changing to play — these are for fine-tuning.
+
+
+-------------------------------------------------------------------------------
+ 8. THE [schema] LINES  (why they matter)
+-------------------------------------------------------------------------------
+
+  On its first connect the bot prints a few [schema] lines describing the EXACT
+  shape of the live feed (top-level keys, a sample unit, and whether projectile
+  / zone / cooldown data is present). This is how we confirm advanced features
+  (dodging spells, tower "juke" positioning) are wired to real field names.
+  If you ever want those upgrades, copy the [schema] lines and share them.
+
+
+-------------------------------------------------------------------------------
+ 9. RUNNING IT 24/7 ON A SERVER (VPS)
+-------------------------------------------------------------------------------
+
+  The bot is very light (well under 1% of one CPU core, ~50-80 MB RAM). Any
+  cheapest-tier Linux VPS runs it. The only thing to watch is bandwidth: the
+  feed is 20 snapshots/sec, which can be a few GB/day — fine for most plans.
+
+    1. Register the API key once in your laptop browser (step 2b), copy the key.
+    2. On the VPS: install Node 18+, copy the files over, run "npm i", then
+       create the .env file there too (copy .env.example to .env and fill it in).
+       Send .env securely (e.g. scp) — do NOT commit it to git.
+    3. Keep it running across reboots/crashes with a process manager:
+
+         npm i -g pm2
+         pm2 start "npx tsx bot.ts" --name dota-bot
+         pm2 save && pm2 startup
+
+    View logs any time with:  pm2 logs dota-bot
+
+
+-------------------------------------------------------------------------------
+ 10. WALLET & ITEMS  (fully optional)
+-------------------------------------------------------------------------------
+
+  The bot tries items in preference order: "Cat Ears" first, then "Ring of
+  Regen" (big HP regen — turns the warrior into a tank). If the server rejects
+  or ignores one, it falls back to the next automatically and logs what
+  happened. Owning items normally requires your account/wallet to own them:
+
+    - NO CRYPTO: buy Ring of Regen with "Silver", earned just by playing human
+      ranked games (Game 1). It's then tied to your account permanently.
+
+    - WALLET: use connect-wallet.ts to link a wallet that owns the item NFT.
+      It's a no-private-key, two-step flow (it prints a message, you sign it in
+      your own wallet, then submit the signature). USE A DEDICATED/BURNER WALLET.
+      Full instructions are in the comments at the top of connect-wallet.ts.
+
+  If you own neither, the bot still plays fine — it just runs without the item.
+
+
+-------------------------------------------------------------------------------
+ 11. TROUBLESHOOTING
+-------------------------------------------------------------------------------
+
+  "command not found: npx"      -> Node isn't installed / not on PATH. See #2a.
+  Error mentioning DOTA_API_KEY -> your .env file is missing or empty. Copy
+                                   .env.example to .env and fill in the values.
+  [rest] deploy 401             -> the API key is wrong.
+  [rest] deploy 400 ... full    -> the game is full; it will keep retrying.
+  [rest] 429 rate-limited       -> it self-throttles and backs off; harmless.
+  [ws] closed, reconnecting     -> a normal blip; it reconnects on its own.
+  Never see [ws] connected      -> the server host may be unreachable from your
+                                   network; check your internet/VPS egress.
+
+
+-------------------------------------------------------------------------------
+ 12. KNOWN LIMITS / WHAT'S NEXT
+-------------------------------------------------------------------------------
+
+  Built and working: real-time feed, world model, measured-damage recall with
+  Divine-Shield awareness, mid-stack lane macro, base defense, escape peels,
+  sprint/stroll tempo, the full ability build.
+
+  Not yet built: fine positional "micro" — the lane-nudge juke to drop tower
+  aggro onto creeps, and proactively side-stepping fireballs/tornados. Those
+  need a movement state-machine layer, which is the natural next addition.
+
+===============================================================================

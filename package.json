@@ -1,0 +1,20 @@
+{
+    "name": "dota-agent-bot",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "start": "tsx bot.ts"
+    },
+    "dependencies": {
+        "ws": "^8.18.0",
+        "viem": "^2.21.0",
+        "dotenv": "^16.4.5"
+    },
+    "devDependencies": {
+        "tsx": "^4.19.0",
+        "typescript": "^5.6.0",
+        "@types/ws": "^8.5.12",
+        "@types/node": "^22.0.0"
+    }
+}
