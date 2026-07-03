@@ -116,6 +116,8 @@ const CFG = {
     jukeCdMs: 7000,           // at most one juke per aggro cycle
     jukeStepMs: 1600,         // restore our lane assignment after the step
     jukeMinCreeps: 3,         // need creeps present to inherit the aggro
+    jukeHitHp: 40,            // only building-sized hits trigger a juke (creeps ~10)
+    deepAdvance: 55,          // past the enemy tower line: pathing warps, kite differently
 
     // Base dance: at the enemy nexus, spam our own lane's tap to bob out of the
     // base arrow's reach while creeps catch aggro.
@@ -337,6 +339,19 @@ function hpLostOver(windowMs: number): number {
         if (b.t - hpHistory[i].t >= windowMs) { a = hpHistory[i]; break; }
     }
     return Math.max(0, a.hp - b.hp);
+}
+
+// Largest single-sample HP drop within the window. At 20 Hz one tower/base arrow
+// is one big step (70/60), while creep hits are ~10 — clean source separation.
+function biggestHitWithin(windowMs: number): number {
+    let max = 0;
+    const t = now();
+    for (let i = hpHistory.length - 1; i > 0; i--) {
+        if (t - hpHistory[i].t > windowMs) break;
+        const d = hpHistory[i - 1].hp - hpHistory[i].hp;
+        if (d > max) max = d;
+    }
+    return max;
 }
 
 function incomingDps(windowMs: number): number {
@@ -1069,6 +1084,27 @@ async function mageKite(me: MeView, lanes: LaneStat[]): Promise<"stand" | "kited
     if (!kiting) { kiting = true; kiteReturnLane = serverLane ?? currentLaneTarget; }
     if (now() - lastKiteAt < CFG.kiteGapMs) return "wait";
 
+    // PAST THE ENEMY TOWERS the pathing warps: a vertical tap takes a couple of
+    // steps then walks FORWARD (into buildings). Kite differently there:
+    //   top/bot -> bob our OWN lane (like the base dance); mid -> one juke, no spam.
+    const myAdvNow = myAdvance(humanAdvOfX(u.x));
+    if (myAdvNow > CFG.deepAdvance) {
+        const cur = serverLane ?? currentLaneTarget;
+        if (cur === "mid") {
+            if (now() - lastJukeAt > CFG.jukeCdMs) {
+                lastJukeAt = now();
+                jukeHomeLane = cur;
+                jukeRestoreAt = now() + CFG.jukeStepMs;
+                await commandLane(jukeDirFor(cur), "deep-mid juke (single step)", { emergency: true });
+                return "kited";
+            }
+            return "stand"; // juke spent: hold and trade rather than warp forward
+        }
+        lastKiteAt = now();
+        await commandLane(cur, `deep kite ${cur} (same-lane bob)`, { emergency: true, allowRepeat: true });
+        return "kited";
+    }
+
     // Keep ONE direction for a few seconds (zig-zagging eats extra hits). Flip when
     // the hold expires or we've arrived at that corridor's y.
     const threat = [...attackers].sort((a, b) => dist(a, u) - dist(b, u))[0];
@@ -1252,7 +1288,7 @@ async function macro() {
         const u = myUnit();
         if (live() && eb && u && dist(u, eb) <= CFG.baseDanceReach) {
             const suddenDeath = (rest?.tick ?? 0) > 18_000; // 15 min in: nexus stops shooting
-            const bleeding = hpLostOver(1000) > 0;
+            const bleeding = biggestHitWithin(1000) >= CFG.jukeHitHp; // the nexus arrow (60), not creep chip
             const wouldDie3 = me.hp <= CFG.baseArrowDmg * 3 + 10;
             const closerAllies = W!.units.filter(
                 (x) => x.faction === myFaction && x.id !== u.id && dist(x, eb) < dist(u, eb) - 25
@@ -1275,7 +1311,7 @@ async function macro() {
     if (here.enemyTowerAlive && advHere > 40 && uncontestedHere) {
         const divineTank = me.heroClass === "melee" && divineCovers(me); // shield up: facetank instead
         if (
-            live() && hpLostOver(900) > 0 && !divineTank &&
+            live() && biggestHitWithin(900) >= CFG.jukeHitHp && !divineTank &&
             here.friendly >= CFG.jukeMinCreeps && now() - lastJukeAt > CFG.jukeCdMs
         ) {
             lastJukeAt = now();
