@@ -101,9 +101,12 @@ const CFG = {
     reachSlack: 8,            // forward-only reachability slack (advance units)
     fightLockRadius: 350,     // enemy hero this close = we're in a fight, hold
 
-    // Mage kiting: attackers must stand still to hit us; our spells don't. Tornado
-    // DoT zones also reward moving, so sustained damage triggers kiting vs mages too.
-    kiteThreatRadius: 260,    // enemy hero this close -> consider stepping
+    // Mage kiting (conservative): step away ONLY when a melee/ranged hero is in
+    // actual attack reach of us AND we're visibly bleeding HP AND we don't clearly
+    // out-HP them. No spells learned yet = never kite (nothing casts while walking).
+    kiteMeleeReach: 90,       // a melee foe within this is actually swinging at us
+    kiteRangedReach: 190,     // a ranged foe within this is actually shooting us
+    kiteHpEdge: 0.25,         // our HP-frac lead at/above this -> stand and win the trade
     kiteGapMs: 1700,          // re-tap cadence (vertical peel is ~1.5s)
     kiteDirHoldMs: 4500,      // keep stepping ONE direction this long before flipping
     kiteSecureFoeFrac: 0.35,  // foe below this (and below us) -> stand and finish them
@@ -1010,28 +1013,41 @@ const LANE_Y: Record<Lane, number> = { top: 420, mid: 1200, bot: 1980 };
 async function mageKite(me: MeView, lanes: LaneStat[]): Promise<"stand" | "kited" | "wait"> {
     const u = myUnit();
     if (!u || !W) return "stand";
-    const ef = enemyOf(myFaction!);
-    const foes = W.units.filter((x) => x.isHero && x.faction === ef && dist(x, u) <= CFG.kiteThreatRadius);
-    if (!foes.length) return "stand";
 
-    // Nearly-dead foe below our own fraction -> stand and finish them.
-    const weakest = [...foes].sort((a, b) => hpFracOf(a) - hpFracOf(b))[0];
+    // No spells yet (early levels) -> kiting is pointless; stand and auto-attack.
+    const hasSpell = me.abilities.some((a) => (a.id === "fireball" || a.id === "tornado") && a.level >= 1);
+    if (!hasSpell) return "stand";
+
+    // Condition 1: a melee/ranged hero is IN ATTACK REACH of us — actually fighting
+    // us, not poking creeps from across the wave.
+    const ef = enemyOf(myFaction!);
+    const attackers = W.units.filter((x) => {
+        if (!x.isHero || x.faction !== ef) return false;
+        const r = roster().find((h) => h.name === x.ownerName);
+        if (!r || r.heroClass === "mage") return false;
+        const reach = r.heroClass === "melee" ? CFG.kiteMeleeReach : CFG.kiteRangedReach;
+        return dist(x, u) <= reach;
+    });
+    if (!attackers.length) return "stand";
+
+    // Condition 2: they're actively damaging US. A foe busy with creeps, tanked by
+    // an ally — or held by our cat charm — isn't, and then we stand and burst them.
+    if (hpLostOver(1200) <= 0) return "stand";
+
+    // Nearly-dead attacker below our own fraction -> stand and finish them.
+    const weakest = [...attackers].sort((a, b) => hpFracOf(a) - hpFracOf(b))[0];
     if (hpFracOf(weakest) < CFG.kiteSecureFoeFrac && hpFracOf(weakest) < hpFracOf(me)) return "stand";
 
-    // Physical attackers lose damage when we move; tornado's DoT zone also rewards
-    // moving — so kite when a physical foe is close OR we're actively bleeding HP.
-    const physicalClose = foes.some((f) => {
-        const r = roster().find((h) => h.name === f.ownerName);
-        return !!r && r.heroClass !== "mage";
-    });
-    if (!physicalClose && hpLostOver(1500) <= 0) return "stand";
+    // Condition 4: our HP significantly higher than theirs -> stand and win the trade.
+    const strongest = [...attackers].sort((a, b) => hpFracOf(b) - hpFracOf(a))[0];
+    if (hpFracOf(me) >= hpFracOf(strongest) + CFG.kiteHpEdge) return "stand";
 
     if (!kiting) { kiting = true; kiteReturnLane = serverLane ?? currentLaneTarget; }
     if (now() - lastKiteAt < CFG.kiteGapMs) return "wait";
 
     // Keep ONE direction for a few seconds (zig-zagging eats extra hits). Flip when
     // the hold expires or we've arrived at that corridor's y.
-    const threat = [...foes].sort((a, b) => dist(a, u) - dist(b, u))[0];
+    const threat = [...attackers].sort((a, b) => dist(a, u) - dist(b, u))[0];
     const arrived = kiteDir && Math.abs(u.y - LANE_Y[kiteDir]) < 160;
     if (!kiteDir || arrived || now() > kiteDirUntil) {
         kiteDir = pickKiteDir(u, threat, lanes);
