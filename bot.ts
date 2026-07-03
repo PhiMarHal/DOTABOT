@@ -111,6 +111,17 @@ const CFG = {
     kiteDirHoldMs: 4500,      // keep stepping ONE direction this long before flipping
     kiteSecureFoeFrac: 0.35,  // foe below this (and below us) -> stand and finish them
 
+    // Tower juke: one tap perpendicular the moment the tower hits us -> quick step,
+    // creeps inherit aggro, we re-aggro the tower. (top tower: tap bot; bot: top; mid: top)
+    jukeCdMs: 7000,           // at most one juke per aggro cycle
+    jukeStepMs: 1600,         // restore our lane assignment after the step
+    jukeMinCreeps: 3,         // need creeps present to inherit the aggro
+
+    // Base dance: at the enemy nexus, spam our own lane's tap to bob out of the
+    // base arrow's reach while creeps catch aggro.
+    baseDanceReach: 340,      // we're "at the base" within this distance
+    baseArrowDmg: 60,         // nexus arrow damage (3-hit death rule)
+
     // Lane command discipline
     laneHoldMs: 6_000,
     escapeSpamMs: 1_500,
@@ -283,6 +294,9 @@ let kiting = false;
 let kiteReturnLane: Lane | null = null;
 let kiteDir: Lane | null = null;
 let kiteDirUntil = 0;
+let lastJukeAt = 0;
+let jukeHomeLane: Lane | null = null;
+let jukeRestoreAt = 0;
 let lastSay = "";
 const baseHpHist: { t: number; hp: number }[] = [];
 
@@ -481,6 +495,10 @@ function myBase(): Bld | undefined {
     return W?.blds.find((b) => !b.isTower && b.faction === myFaction);
 }
 
+function enemyBase(): Bld | undefined {
+    return myFaction ? W?.blds.find((b) => !b.isTower && b.faction === enemyOf(myFaction!)) : undefined;
+}
+
 // Our own advance position (-100 our base .. +100 their base).
 function myAdv(here: LaneStat): number {
     const u = myUnit();
@@ -664,6 +682,9 @@ function resetRoundState() {
     kiteReturnLane = null;
     kiteDir = null;
     kiteDirUntil = 0;
+    lastJukeAt = 0;
+    jukeHomeLane = null;
+    jukeRestoreAt = 0;
     lastSay = "";
     baseHpHist.length = 0;
 }
@@ -1010,6 +1031,9 @@ function landingSafe(l: LaneStat, me: MeView): boolean {
 
 const LANE_Y: Record<Lane, number> = { top: 420, mid: 1200, bot: 1980 };
 
+// Tower-juke step direction (coached): top tower -> tap bot; bot -> tap top; mid -> tap top.
+const jukeDirFor = (lane: Lane): Lane => (lane === "top" ? "bot" : "top");
+
 async function mageKite(me: MeView, lanes: LaneStat[]): Promise<"stand" | "kited" | "wait"> {
     const u = myUnit();
     if (!u || !W) return "stand";
@@ -1098,6 +1122,7 @@ async function macro() {
 
     // Dead: pre-position for the best lane (reachability waived — we respawn at base).
     if (!me.alive) {
+        kiting = false; kiteDir = null; kiteReturnLane = null; jukeHomeLane = null;
         const best = [...evals].sort((a, b) => b.score - a.score)[0];
         if (best && best.l.lane !== effLane) await commandLane(best.l.lane, `pre-set respawn (${best.score.toFixed(1)})`, { emergency: true });
         return;
@@ -1107,6 +1132,18 @@ async function macro() {
     // command now would redirect the teleport, and "escape" makes no sense mid-channel.
     // (The deliberate defend-landing steer runs outside the macro and still works.)
     if (channelingRecall()) { dbg("channeling recall — silent"); return; }
+
+    // Mid-juke window: we tapped perpendicular at a tower. Stay silent for the step,
+    // then restore our real lane assignment so all lane logic stays coherent.
+    if (jukeHomeLane) {
+        if (now() < jukeRestoreAt) return;
+        const back = jukeHomeLane;
+        jukeHomeLane = null;
+        if ((serverLane ?? currentLaneTarget) !== back) {
+            await commandLane(back, "juke re-aggro", { emergency: true, allowRepeat: true });
+            return;
+        }
+    }
 
     // 1) Slow-path recall (REST mode; fast path is reflex()).
     if (!live() && ready("recall")) {
@@ -1206,11 +1243,47 @@ async function macro() {
         if (back && back !== effLane) { await commandLane(back, "kite return", { emergency: true }); return; }
     }
 
-    // 5) SIEGE-HOLD: hitting a tower uncontested is a primary objective. Never
-    //    wander off it for a merely "better-scored" lane.
+    // 5a) BASE SIEGE: we're at their nexus — hold it, and dance the base arrow.
+    //     The dance: spam OUR lane's tap; the vertical bob breaks arrow range for a
+    //     beat while creeps catch aggro. Stop once allies have the aggro — unless
+    //     three more arrows would kill us, then keep dancing regardless.
+    {
+        const eb = enemyBase();
+        const u = myUnit();
+        if (live() && eb && u && dist(u, eb) <= CFG.baseDanceReach) {
+            const suddenDeath = (rest?.tick ?? 0) > 18_000; // 15 min in: nexus stops shooting
+            const bleeding = hpLostOver(1000) > 0;
+            const wouldDie3 = me.hp <= CFG.baseArrowDmg * 3 + 10;
+            const closerAllies = W!.units.filter(
+                (x) => x.faction === myFaction && x.id !== u.id && dist(x, eb) < dist(u, eb) - 25
+            ).length;
+            const dance = !suddenDeath && bleeding && (closerAllies < 2 || wouldDie3);
+            if (dance) {
+                await commandLane(effLane, "base dance (dodge nexus arrow)", { emergency: true, allowRepeat: true });
+                return;
+            }
+            say(`hitting enemy base${suddenDeath ? " (sudden death)" : ""} — holding`);
+            return;
+        }
+    }
+
+    // 5b) SIEGE-HOLD: hitting a tower uncontested is a primary objective. Never
+    //     wander off it for a merely "better-scored" lane. The moment it hits us,
+    //     juke ONCE perpendicular so creeps inherit the aggro, then re-aggro.
     const advHere = myAdv(here);
     const uncontestedHere = live() ? enemyHeroesNearMe(420) === 0 : here.enemyHeroesHere === 0;
     if (here.enemyTowerAlive && advHere > 40 && uncontestedHere) {
+        const divineTank = me.heroClass === "melee" && divineCovers(me); // shield up: facetank instead
+        if (
+            live() && hpLostOver(900) > 0 && !divineTank &&
+            here.friendly >= CFG.jukeMinCreeps && now() - lastJukeAt > CFG.jukeCdMs
+        ) {
+            lastJukeAt = now();
+            jukeHomeLane = effLane;
+            jukeRestoreAt = now() + CFG.jukeStepMs;
+            await commandLane(jukeDirFor(effLane), "tower juke (creeps take aggro)", { emergency: true });
+            return;
+        }
         say(`sieging ${effLane} tower (${here.enemyTowerHp | 0}hp) — holding`);
         return;
     }
