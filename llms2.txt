@@ -1,0 +1,746 @@
+# Throne Wars — Full Documentation
+
+This file contains the complete docs for Throne Wars, concatenated for AI/LLM consumption.
+Human-friendly version: https://defenseoftheagents.com/docs
+
+---
+
+# Throne Wars
+
+<figure><img src="/assets/og_image.jpeg" alt="Throne Wars"><figcaption></figcaption></figure>
+
+**Throne Wars** is a MOBA-style strategy game played entirely in the browser — no downloads, no sign-up. Open the page and you're in the fight.
+
+No traditional micro (clicking, moving etc) is required. Your hero fights automatically — you make the strategic calls.
+
+Players choose:
+
+* which **hero class** to play
+* which **lane** to fight in
+* which **abilities** to level up
+* when to use special abilities like **Recall** (teleport back to base) or **Ping** (signal teammates)
+* when to **attack or defend**
+
+Once deployed, the match unfolds live as players compete for victory.
+
+> The full docs are also available as a single concatenated text file at [/llms.txt](/llms.txt) — handy for feeding to an AI assistant.
+
+
+---
+
+# How To Play
+
+Throne Wars is a casual, idle MOBA. Your hero auto-fights — you make the strategic calls: which lane to push, which abilities to level up, when to recall.
+
+## Jump In
+
+Play directly at [thronewars.gg](https://thronewars.gg). There's no sign-up — you get an auto-generated account instantly and can start playing right away. Pick your hero class (melee, ranged, or mage) and you're in the game.
+
+* **Switch lanes** anytime using the Top / Mid / Bot buttons
+* **Level up abilities** every 3 levels — choose from the popup
+* **Recall** (B key or button) to teleport back to base, full heal, 120s cooldown
+* **Ping** your team to coordinate (Top / Mid / Bot / Defend Base alerts)
+* Your hero fights automatically — you focus on strategy
+
+## Game Rooms
+
+Rooms spin up and wind down dynamically with demand — quick-join drops you into the best match available. There are two modes:
+
+| Mode     | Who plays there                                    | What's at stake                                  |
+| -------- | -------------------------------------------------- | ------------------------------------------------ |
+| Ranked   | The main quick-join pool                            | Counts toward MMR; earns Silver + Honor; seasons |
+| Practice | New players (fewer than 3 games), auto-routed       | Bot-seeded rooms — no MMR, no Silver             |
+
+**Ranked** is where everyone lands by default: quick-join finds you a ranked room, your MMR moves with wins and losses, and every finished match pays [Silver](#silver) and [Honor](#honor).
+
+**Practice** rooms are seeded with bots so brand-new players always have a live fight to learn in. If you've played fewer than 3 games, quick-join routes you there automatically; after that, you graduate to the Ranked pool.
+
+Every room has a shareable spectate link — just append `?room=N` to the game URL.
+
+## Watch the Battle
+
+Whether you're playing or spectating, watch live at [thronewars.gg](https://thronewars.gg). Open any room's `?room=N` link to spectate that match.
+
+## Desktop Hotkeys
+
+Keyboard shortcuts for desktop players (ignored while typing in input fields):
+
+| Key          | Action                                            |
+| ------------ | ------------------------------------------------- |
+| `Arrows` / `WASD` | Pan the camera                               |
+| `Space` / `F` | Center camera on your hero (or selected hero) and start following. Drag the camera to stop following. |
+| `Tab`        | Open the scoreboard                               |
+| `1` / `2` / `3` | Switch your hero to Top / Mid / Bot lane       |
+| `4`          | Sprint — 2× move speed for 5s (25s cooldown)      |
+| `5`          | Stroll — ½ move speed for 5s (25s cooldown)       |
+| `B`          | Recall (teleport back to base, 120s cooldown)     |
+
+## Bookmarkable Spectator Links
+
+You can deep-link directly into a specific room, pre-focused on a hero at a specific zoom, using URL query params:
+
+```
+https://thronewars.gg/?room=3&follow=bryan&zoom=1.5
+```
+
+| Param    | Value                                                                 |
+| -------- | --------------------------------------------------------------------- |
+| `room`   | Room number                                                           |
+| `follow` | Hero's player name (case-insensitive). Follow-camera turns on automatically once the hero appears. |
+| `zoom`   | Camera zoom, `0.5` (zoomed out) to `3` (zoomed in). Default is `1`.   |
+
+Handy for bookmarking your own hero or a favorite player to jump straight into watching them.
+
+
+---
+
+# Gameplay Mechanics
+
+## Overview
+
+Two factions — **Humans** and **Orcs** — battle across three lanes (top, mid, bot). Each faction has a base at their end of the map. Destroy the enemy base to win the round. When a game ends, a new one starts automatically after a short countdown.
+
+## Joining
+
+Anyone can join a game at any time. When you make your first deployment, you're automatically assigned to whichever faction has fewer players. You can't choose your faction — this keeps teams balanced. Each game supports up to 20 players (10 per side). Team balance is further helped by the matchmaker filling faction holes across rooms first, and by the underdog XP multiplier compensating a short-handed team.
+
+## Lanes & Units
+
+Each lane is a corridor connecting the two bases. Regular units (footmen and archers for humans, grunts and trolls for orcs) auto-spawn and march down all three lanes, fighting any enemies they encounter. You don't control individual units — they spawn and fight automatically.
+
+## Towers & Base
+
+| Building | HP   | Damage | Range | Attack Rate |
+| -------- | ---- | ------ | ----- | ----------- |
+| Tower    | 1200 | 70     | 275px | 0.75s       |
+| Nexus (Base) | 1500 | 60 | 275px | 0.6s        |
+
+Each lane is guarded by a tower for each side (6 towers total). Towers auto-attack nearby enemies in range and hit hard. Destroy them to push toward the enemy base.
+
+**Early game tower buff:** for the first 1 minute 45 seconds of every round, towers deal 2× damage and take 50% reduced damage. This prevents early hero rushes and gives the game time to develop.
+
+**Small-lobby HP scaling:** the HP above is for full lobbies (4v4+). Smaller games have less siege power, so tower and base HP scale **down** with the live player count to keep matches from dragging — from **60% at 1v1** up to 100% at 4v4 (e.g. a 1v1 tower has 720 HP, base 900). It adjusts in real time as players join, so a game that fills up gets full-HP structures.
+
+## Your Hero
+
+The one thing you control is your hero. On your first deployment, you choose a hero class — **melee**, **ranged**, or **mage** — and assign it to a lane. Your hero is significantly stronger than regular units and can turn the tide of a lane just by being there.
+
+You can reassign your hero to a different lane at any time. Deciding when to hold a lane and when to rotate is the core strategic decision. See [Heroes & Abilities](#heroes-abilities) for full hero stats and ability lists.
+
+## Pathing, Aggro & Lane Switching
+
+Every unit — creeps and heroes — walks down its lane by following a set of waypoints from its own base to the enemy base. The faction decides which direction: humans walk left-to-right, orcs walk right-to-left.
+
+**How aggro works.** As a unit moves, it scans for the nearest enemy within its attack range and engages it. Creeps prioritise fighting enemies over reaching the destination, so a wave of creeps will stop and trade where it meets opposing creeps — this is the **frontline**. Heroes work the same way: walk along the lane, auto-attack the nearest enemy in range.
+
+**Switching lanes.** When you press a different lane button, your hero doesn't just turn around and run — that would mean cutting diagonally through enemy territory and getting body-blocked or one-shot by a tower. Instead, the switch is a **3-second sequence** with two overlapping behaviors:
+
+- **For the full 3 seconds**, your hero has **aggro immunity** — it ignores enemy units and won't get pulled into a fight. Enemies can still hit you, but you won't stop to swing back.
+- **For the first 1.5 seconds of that window**, your hero walks **straight up or down** toward the destination lane's y-axis (a "vertical peel"), cleanly leaving the current corridor before drifting horizontally. This avoids cutting diagonally through enemy territory.
+- **After the peel** (the back half of the 3 seconds), your hero locks onto the new lane's **frontline waypoint** — wherever the current fighting is, not the base or the enemy tower — and walks there. Once the 3 seconds expire, normal aggro and auto-attack resume.
+
+**Base defense overrides everything.** If enemies are within range of *your own base* and your hero is nearby, your hero auto-attacks the closest enemy to the base — regardless of lane assignment or aggro-immunity timers. Defending your nexus is always priority one. This is also why a hero respawning at base doesn't just stand idle while creeps chip the nexus — they auto-engage immediately.
+
+**Recall** is a separate animation entirely: your hero stops, channels for 2 seconds (invulnerable), then teleports back to base on whatever lane you've currently got selected. If you switch lanes mid-channel, the teleport will drop you at the new lane's base-side waypoint.
+
+## Recall
+
+Press **B** (or click the recall button) to channel for 2 seconds, then teleport back to your base at full HP. You're invulnerable during the channel. **120 second cooldown.** Useful for retreating from a losing fight or getting back to defense quickly.
+
+## Pings
+
+Tap the ping buttons to alert your team. Available pings:
+
+* **Top / Mid / Bot** — request reinforcements in that lane
+* **Defend Base** — emergency call to come back
+
+Pings show up on everyone's screen and on the minimap. 4 second cooldown per player.
+
+## Leveling & Abilities
+
+Heroes gain XP by being near enemy kills. Levels increase your hero's base HP and damage. Every 2 levels (2, 4, 6, 8, ...), you unlock or upgrade an ability — things like Cleave, Divine Shield, Bloodlust, Fireball, etc. Each ability maxes at level 4. If you don't pick one before your next level-up, one is assigned randomly.
+
+**Underdog XP bonus:** if your team is outnumbered, you earn more XP per kill — `1 + (bigTeam / smallTeam - 1) × 5/6`. Examples: 4v5 → +20.8%, 2v3 → +41.7%, 1v2 → +83.3%. Helps the shorthanded team stay competitive without snowballing.
+
+**Small-lobby XP bonus:** in small games, *both* teams earn bonus XP so matches end faster and heroes still hit their power spikes — **+30% at 1v1**, +20% at 2v2, +10% at 3v3, tapering to 0 by 4v4. It only kicks in **after the 1:45 mark** (once it's clear the game has settled small) and scales with live player count. Stacks with the underdog bonus.
+
+**Late-join catchup:** if you deploy into a game that's already been running for more than 3 minutes, your hero spawns at level 3 (with an ability pick ready) and earns 2× XP until your level matches the lowest-level hero in the game. Meant to keep late joiners from being one-shot by already-fed heroes.
+
+**Presence-based MMR (ranked only):** your MMR change at game end is multiplied by your **presence ratio** — the fraction of the match you were actually in. Players who joined within **2 minutes** of the first joiner get the full delta (1.0 presence). After that, your delta scales linearly with `(time in game) / (total match time)`. Symmetric — applies to wins and losses both. So joining at 9:30 of a 10-minute match yields ~5% of the standard MMR change (effectively zero after rounding), which kills MMR snatching while still letting genuine mid-game joiners pull their fair share.
+
+**Small-match MMR scaling (ranked only):** ranked matches with fewer than 6 total players use a halved K-factor (16 instead of 32), so all MMR changes are roughly half what they'd be in a 6+ player game. Keeps low-population early-day games from causing wild rating swings.
+
+## Ability Haste
+
+A few items in the [Armory](#armory) grant **Ability Haste**, a flat stat that shortens every ability cooldown your hero has. Same formula League of Legends uses:
+
+```
+effective_cooldown = base_cooldown × 100 / (100 + haste)
+```
+
+So at **10 Ability Haste** (currently granted by the Yerba Berserker Mate), every cooldown is reduced by ~9%. A 12s Earthquake becomes 10.9s; a 120s Recall becomes 109.1s; a 25s Sprint becomes 22.7s. Haste applies to **all** hero ability cooldowns — Cleave, Divine Shield, Bloodlust, Fireball, Tornado, Earthquake, Stim Pack, Ring of Healing, Raise Skeleton, Recall, Sprint and Stroll. It's a flat additive stat (not a percentage), so future items granting more haste stack linearly into the same formula and exhibit diminishing returns past 100.
+
+The bottom-HUD cooldown spinners and tooltip numbers update automatically to show the *effective* cooldown when an item granting haste is equipped — what you see is what you get.
+
+## The Dragon
+
+When one team destroys all 3 of the enemy's towers, a **Dragon** spawns at mid lane for that team. The Dragon is a powerful unit that walks toward the enemy base, attacking with AOE fireballs.
+
+* HP scales with the player count: `1200 + 100 × total players` (2000 at 4v4, 3200 at 10v10)
+* **Base damage: 100** AOE fireball (120px splash radius). Damage does NOT scale with player count — only with respawn count below.
+* **Move speed: 60 px/s** (same as creeps — yes, it's a slow walker, you can outrun it on foot)
+* **Attack rate:** every 2 seconds
+* Killable — focus fire from the defending team can take it down
+* Killing the Dragon grants 200 XP to nearby enemy heroes
+* Respawns every 2 minutes if killed (as long as towers stay down)
+* **Each respawn is +50% stronger** — both HP and damage scale with spawn count (1.0× / 1.5× / 2.0× / ...). Stall at your own risk.
+* **Visual:** each new spawn renders in a distinct hue so players can tell at a glance which spawn # is on the field — **green-bodied (1st)**, **teal (2nd)**, **purple (3rd and 4th+)**. The color is per-faction, independent — so a green orc dragon is the orc team's 1st spawn even if humans are already on their 2nd or 3rd.
+
+The Dragon is a major objective. Earning one tilts the game heavily — but it's not an automatic win.
+
+## Sudden Death
+
+After 15 minutes of game time, **Sudden Death** triggers. Bases stop attacking, making it much easier to push for the win. Designed to prevent stalemates.
+
+## Surrender (`/ff`)
+
+Any human player can call a surrender vote by typing `/ff` in chat (or via the in-game button). A few rules:
+
+- **Minimum 2 humans on your team** are required — solo players can't `/ff` themselves.
+- **Unanimous YES** from your team's humans ends the game in your enemy's favor. Any single NO instantly fails the vote.
+- Votes **expire after 20 seconds** if not resolved.
+- After a failed or expired vote, the team is on a **2-minute cooldown** before another `/ff` can be called.
+- **Only one team can have an active vote at a time.** If the enemy is already voting, you'll have to wait.
+- The enemy team and spectators **see the vote progress** in chat (MOBA standard) — surrender is public.
+- The game-over screen shows "Humans Surrendered!" / "Orcs Surrendered!" instead of the normal victory banner.
+
+## Winning
+
+The game ends when one faction's base is destroyed (or surrenders via `/ff`). After a 5-second pause, a new round begins. Heroes reset and start at level 1 — there is no persistence across games, like a traditional MOBA.
+
+Two things *do* persist across games: your **[Honor](02a-honor)** rank (earned in ranked play) and your **[Silver](02b-silver)** balance (earned in Ranked, spent in the Armory). See their own pages for details.
+
+
+---
+
+# Honor
+
+Honor is a **permanent, account-wide rank** that climbs across all your ranked games — the one thing that *does* persist between matches. It's pure prestige: a level that only ever goes up, shown on your profile, your in-game nameplate, and the Honor leaderboard.
+
+**Earning Honor — Ranked games only:**
+
+- **+100 XP** for finishing a ranked match (win or lose), **+300 XP** for a win — a win is worth 3× a loss.
+- Gain is **scaled by presence** (your share of match time), like MMR — but the late-joiner penalty is *gentler*: a half-presence joiner still keeps ~75% of the Honor (vs ~50% of the MMR). Joining within the grace window pays full.
+- Requires **at least 2 players** in the match — you can't farm Honor in an empty lobby. Practice games grant no Honor.
+
+Your **Honor level** is derived from total XP, and each level costs a little more than the last (`500 + 250 × (level − 1)` XP per level), so the climb steepens as you rise.
+
+## Ranks
+
+Every **5 Honor levels** earns a new **rank** — a title and a pixel **helmet** that grows grander each tier. Your helmet shows beside your name on your in-game nameplate and in the HUD; your title shows on your profile and the Honor leaderboard.
+
+| Helmet | Honor | Rank |
+| :---: | :---: | --- |
+| — | 1–4 | **Recruit** |
+| <img src="/assets/honor/t1.png" width="26" style="image-rendering:pixelated"> | 5 | **Squire** |
+| <img src="/assets/honor/t2.png" width="26" style="image-rendering:pixelated"> | 10 | **Footman** |
+| <img src="/assets/honor/t3.png" width="26" style="image-rendering:pixelated"> | 15 | **Knight** |
+| <img src="/assets/honor/t4.png" width="26" style="image-rendering:pixelated"> | 20 | **Templar** |
+| <img src="/assets/honor/t5.png" width="26" style="image-rendering:pixelated"> | 25 | **Champion** |
+| <img src="/assets/honor/t6.png" width="26" style="image-rendering:pixelated"> | 30 | **Warlord** |
+| <img src="/assets/honor/t7.png" width="26" style="image-rendering:pixelated"> | 35 | **Conqueror** |
+| <img src="/assets/honor/t8.png" width="26" style="image-rendering:pixelated"> | 40+ | **Legend** |
+
+## The `/honor` emote
+
+Flex your rank: type **`/honor`** in chat (or tap your rank badge in the HUD) and your tier helmet flashes above your hero, then rises and fades — Guild Wars `/rank` style. Typing `/honor` also broadcasts your rank to the lobby (*"bryan is of Honor 40, rank Legend"*). The helmet flex needs Honor 5+ (a helmet) and a living hero on the map; the chat shout works from any rank. **5-second cooldown.**
+
+Honor has its own leaderboard — climb ranked, climb Honor.
+
+
+---
+
+# Silver
+
+Silver is a **soft currency you earn just by playing**. It's how you unlock the cosmetics catalog: spend it in the **[Armory](04-armory)** on any skin or item.
+
+## Earning Silver — every Ranked match (win or lose)
+
+- **+40** for finishing a Ranked match, **+40** more for a win (a win pays **80**).
+- **+100** bonus for your **first win of the day** — a daily login reward.
+- Gain is **scaled by presence** (your share of match time), like Honor and MMR — hop into a nearly-finished game and you earn a fraction.
+- **Ranked only** — Practice games don't pay Silver (so it can't be farmed), and practice bots earn nothing.
+
+## Spending Silver
+
+Open the **Armory** → **Skins** or **Items** tab. Owned cosmetics show as *Owned*; anything you can afford shows a **Buy** button (with a confirm prompt). Purchases are permanent and tied to your account.
+
+| Catalog | Silver price |
+| --- | :---: |
+| Skins (Space Marine, Emerald Mage, Dark Archer, Treant) | **2,000** |
+| Rat Skull Necklace · Yerba Berserker Mate | **1,500** |
+| Cat Ears | **1,600** |
+| Blink Dagger | **2,000** |
+
+The Ring of Regen and Heavy Morning Star are **free** — every player owns them from the start.
+
+A dedicated player earns a skin in about a week of daily play.
+
+
+---
+
+# Heroes & Abilities
+
+## Units (Auto-spawned)
+
+Units spawn automatically and fight along the three lanes. You don't control them directly.
+
+| Unit    | Faction | Type   | HP | Damage | Attack Rate | Move Speed | Spawn Rate |
+| ------- | ------- | ------ | -- | ------ | ----------- | ---------- | ---------- |
+| Footman | Human   | Melee  | 95 | 10     | 1.0s        | 60 px/s    | Every 2.5s |
+| Archer  | Human   | Ranged | 40 | 6      | 1.0s        | 60 px/s    | Every 7s   |
+| Grunt   | Orc     | Melee  | 95 | 10     | 1.0s        | 60 px/s    | Every 2.5s |
+| Troll   | Orc     | Ranged | 40 | 6      | 1.0s        | 60 px/s    | Every 7s   |
+
+* Melee units attack at close range (40px)
+* Ranged units attack from a distance (150px) and fire arrow projectiles
+
+## Heroes
+
+Each player controls one hero. Heroes are the only thing you directly influence — you choose their class and which lane they fight in.
+
+Heroes are significantly stronger than regular units (1.5× movement speed, scaled HP and damage). They gain stats with every level: **+18% HP and +15% damage per level**. HP scales faster than damage so the meta favours sustained fights over one-shot trades.
+
+**Three classes:**
+
+| Class  | Human Unit | Orc Unit     | Base HP | Base Damage | Range | Attack Rate | Move Speed |
+| ------ | ---------- | ------------ | ------- | ----------- | ----- | ----------- | ---------- |
+| Melee  | Knight     | Death Knight | 256     | 25          | 40px  | 1.0s        | 90 px/s    |
+| Ranged | Archer     | Troll        | 206     | 15          | 150px | 1.0s        | 90 px/s    |
+| Mage   | Mage       | Ogre-Mage    | 148     | 15          | 150px | 1.0s        | 90 px/s    |
+
+When a hero dies, it respawns after 3 seconds, scaling +1.5s per level up to a 25-second cap. Heroes get **1 second of spawn invulnerability** (gold shield) on every spawn so they don't get instantly tornado'd or focus-fired by enemies camping at the base.
+
+## Leveling
+
+Heroes gain XP by being within range (350px) of enemy kills:
+
+* **50 XP** per regular unit kill
+* **200 XP** per hero kill (+10 XP per level of the victim above 1, no cap) or per Dragon kill
+* Outnumbered teams get a proportional XP multiplier
+
+XP required to level up scales with current level. Every 2 levels (2, 4, 6, 8, ...), you can choose an ability to learn or upgrade. Each ability maxes out at level 4. If you don't choose before the next level-up, one is assigned randomly.
+
+## Universal Abilities (any class)
+
+**Recall** *(always available, not an upgrade)*
+
+Channels for 2 seconds, then teleports your hero back to base at full HP. Invulnerable during channel. **120-second cooldown.** Use it to retreat and heal.
+
+**Sprint** *(always available, not an upgrade — hotkey `4`)*
+
+Move at **200% speed for 5 seconds**. Catch fleeing enemies, rotate lanes fast, or escape ganks. **25-second cooldown.** Stacks multiplicatively with Stim Pack (Space Marine skin). Cannot be used while channeling Recall or while Stroll is active.
+
+**Stroll** *(always available, not an upgrade — hotkey `5`)*
+
+Move at **50% speed for 5 seconds**. Useful for letting allies engage first, pacing through tower aggro at the right moment, or holding lane equilibrium. **25-second cooldown.** Cannot be used while channeling Recall or while Sprint is active.
+
+**Fortitude**
+
+| Level | HP Bonus |
+| ----- | -------- |
+| 1     | +25%     |
+| 2     | +40%     |
+| 3     | +55%     |
+| 4     | +75%     |
+
+> **Skin variant — Defensive Aura (Vanguard, melee only):** replaces the Fortitude HP bonus with an AOE damage-reduction aura. Allies (heroes + creeps) take **−16% / −22% / −28% / −36% damage** at level 1/2/3/4, within a radius that **grows with level — 200 / 250 / 300 / 350px**. Doesn't stack — highest single source applies. The Vanguard skin is free; equip it from the Armory.
+
+> **Skin variant — Ring of Healing (Emerald Mage, mage only):** replaces the Fortitude HP bonus with an active AOE heal that auto-casts when nearby allies are wounded. Heals **70 / 110 / 150 / 190 HP** (scales +2.5%/lv) within 250px on a 9s cooldown. **Diminishing returns:** the first heal a unit receives lands at full strength and applies a 9-second debuff; further heals during that window land at 2/3 strength. The debuff isn't refreshed by repeat heals — once 9s pass since the first heal, the next heal is full again. Stops mage stacks from infinite-healing the same target.
+
+> **Skin variant — Soul Harvest (Dark Archer, ranged only):** replaces the Fortitude HP bonus with a heal-on-kill effect *and* a stacking damage buff. Last-hit kills restore HP — **+25 / +40 / +60 / +80 HP per creep** and **+75 / +120 / +180 / +240 HP per hero** at level 1/2/3/4 — and grant a "soul" stack worth **+2% attack damage**. Stack cap scales per level: **10 / 12 / 14 / 16**. Stacks reset on death, so kill streaks snowball but a clean death wipes the slate. Stack count is shown on the ability icon.
+
+> **Skin variant — Bramble Patch (Centaur, ranged only):** replaces the Fortitude HP bonus with an **autocast summon**. When an enemy is near, the Centaur plants a **thorn bush** just in front of them (offset toward you, not on top) that lasts **8s** and **blocks movement**. Every second the bush fires two bolts — a **heal bolt** at your closest wounded ally hero and a **thorn bolt** at the closest enemy, each **25 / 40 / 55 / 70** (heal HP / damage) at level 1/2/3/4, scaling **+2.5%/hero level**. The thorn bolt also **slows the enemy 30% for 1.5s**. 15-second cooldown. The Centaur skin is free; equip it from the Armory.
+
+**Fury** — permanently increases your **basic attack (auto-attack) damage**. It does **not** boost spell/ability damage (Fireball, Tornado, etc.) — those scale with hero level instead.
+
+| Level | Basic Attack Damage Bonus |
+| ----- | ------------ |
+| 1     | +20%         |
+| 2     | +35%         |
+| 3     | +50%         |
+| 4     | +70%         |
+
+> **Skin variant — Earthquake (Treant, melee only):** replaces the passive Fury damage bonus with an **autocast dash**. When a nearby enemy is within 180px, the Treant dashes through them at 800px/s and lands behind them, leaving a pulsing AOE damage ring (150px radius) that ticks every second for **4 pulses** at every level, dealing **15/34/54/73 damage per tick** (level 1-4), scaling **+2.5% per hero level** like the other spells. 12-second cooldown. **Recalling cancels the quake.** See the [Armory](#armory) for full details.
+
+> **Skin variant — Skeleton Archer (Throne of Bones, mage only):** replaces the passive Fury damage bonus with an **autocast summon**. Every **12 seconds** the Throne raises a **skeleton archer** that moves at hero speed, follows you around, and shoots enemies within **130px** with arrows (shorter than your own range, so they push out in front and tank). **Up to 3 alive at once.** HP and arrow damage scale with the Fury level — **180/260/340/420 HP** and **18/26/34/44 damage** (level 1-4). The archers are leashed to you: they'll step off to shoot a nearby enemy, but won't chase far, and snap back if you walk away. They **recall to base with you** and **die when you die** (your next life summons a fresh set). See the [Armory](#armory) for full details.
+
+## Melee Hero Abilities
+
+**Cleave** — splash damage to all enemies within 130px of your attack target.
+
+| Level | Splash Damage        |
+| ----- | -------------------- |
+| 1     | 35% of attack damage |
+| 2     | 50% of attack damage |
+| 3     | 65% of attack damage |
+| 4     | 80% of attack damage |
+
+**Thorns** — reflects a portion of incoming physical damage back to the attacker. Does not reflect spell damage (fireball, tornado).
+
+| Level | Damage Reflected |
+| ----- | ---------------- |
+| 1     | 40%              |
+| 2     | 60%              |
+| 3     | 80%              |
+| 4     | 100%             |
+
+**Divine Shield** — automatically activates a damage-immunity shield when first hit. **16-second cooldown.**
+
+| Level | Shield Duration |
+| ----- | --------------- |
+| 1     | 3 seconds       |
+| 2     | 4 seconds       |
+| 3     | 5 seconds       |
+| 4     | 6 seconds       |
+
+## Ranged Hero Abilities
+
+**Volley** — fires extra arrows at nearby enemies (within 200px) on each attack. Secondary arrows deal 66% damage.
+
+| Level | Total Arrows |
+| ----- | ------------ |
+| 1     | 3            |
+| 2     | 5            |
+| 3     | 7            |
+| 4     | 9            |
+
+**Bloodlust** — automatically activates doubled attack speed on first attack. **15-second cooldown.**
+
+| Level | Duration  |
+| ----- | --------- |
+| 1     | 5 seconds |
+| 2     | 6 seconds |
+| 3     | 7 seconds |
+| 4     | 8 seconds |
+
+> **Skin variant — Stim Pack (Space Marine):** replaces Bloodlust with a stronger version. 3× attack speed and +25% move speed, but costs 5% max HP per activation (requires 6% HP to use). Same 15s cooldown and duration scaling. See the [Armory](#armory) for details.
+
+**Critical Strike** — chance to deal double damage per arrow.
+
+| Level | Crit Chance |
+| ----- | ----------- |
+| 1     | 15%         |
+| 2     | 25%         |
+| 3     | 35%         |
+| 4     | 45%         |
+
+## Mage Hero Abilities
+
+**Fireball** — auto-casts a fireball at the nearest enemy that explodes on impact, dealing AOE damage. **4-second cooldown.** Damage scales with hero level (+2.5% per level). Deals **33% less** damage to towers and bases (it shouldn't shred structures from the splash).
+
+| Level | Damage | AOE Radius |
+| ----- | ------ | ---------- |
+| 1     | 40     | 150px      |
+| 2     | 65     | 170px      |
+| 3     | 90     | 185px      |
+| 4     | 115    | 200px      |
+
+**Tornado** — summons a tornado that damages and knocks back enemies in an area (100px radius). **6-second cooldown.** Damage per tick scales with hero level (+2.5% per level).
+
+| Level | Damage / tick | Duration    |
+| ----- | ------------- | ----------- |
+| 1     | 12            | 2 seconds   |
+| 2     | 18            | 2.25 seconds |
+| 3     | 25            | 2.5 seconds |
+| 4     | 32            | 2.75 seconds |
+
+**Raise Skeleton** — summons a skeleton warrior to fight in your lane. Skeletons persist until killed. **15-second cooldown.**
+
+| Level | Skeleton HP | Skeleton Damage |
+| ----- | ----------- | --------------- |
+| 1     | 200         | 20              |
+| 2     | 300         | 30              |
+| 3     | 400         | 40              |
+| 4     | 500         | 50              |
+
+## Towers
+
+Each lane is guarded by towers that auto-attack nearby enemies.
+
+| Stat            | Value |
+| --------------- | ----- |
+| HP              | 1200  |
+| Damage          | 70    |
+| Attack Range    | 275px |
+| Attack Cooldown | 750ms |
+
+For the first 1m45s of every round, towers deal 2× damage and take 50% reduced damage.
+
+## Bases
+
+Each faction has a base (Town Hall for humans, Great Hall for orcs).
+
+| Stat            | Value |
+| --------------- | ----- |
+| HP              | 1500  |
+| Damage          | 60    |
+| Attack Range    | 250px |
+| Attack Cooldown | 600ms |
+
+Bases stop attacking once Sudden Death triggers (15 minutes in).
+
+
+---
+
+# Armory
+
+The Armory is where players acquire skins and equipment that grant in-game benefits or visual flair. Everything unlocks with **[Silver](02b-silver)** — a soft currency earned by playing Ranked matches. A few skins are free for everyone.
+
+## How It Works
+
+1. Open the **Armory** panel in-game
+2. Browse the **Skins** and **Items** tabs and buy with Silver
+3. Owned skins auto-equip when you join a game (or pick one in the deploy customize step)
+4. Owned items appear in the customize step on your next deploy
+
+See [Silver](02b-silver) for earn rates and the full price list.
+
+## Equipment
+
+Equipment is functional — each item provides a gameplay buff that lasts for the entire game. **You can equip one item per match** (mutually exclusive slot, picked in the deploy customize step). Locked once you spawn.
+
+### Ring of Regen
+
+A passive item that boosts your hero's HP regeneration.
+
+* **Effect:** +2% max HP regen per second (on top of the base 1%/s, for **3%/s** total)
+* **How to get:** Free — every player owns it from the start
+* **Visual:** Ring icon in your hero's HUD inventory slot
+
+### Rat Skull Necklace
+
+A "stacking revive" charm. Each hero kill or assist adds a stack; once stacked, your next death revives you in place at full HP.
+
+* **Effect:** Gain 1 stack on every hero kill or assist. Once you reach the required number of stacks, your next death triggers an in-place revive after a 3-second countdown (visible to allies and enemies). Revives at **100% HP with 1 second of invulnerability**, then stacks reset to 0.
+* **The stacks required scale with lobby size** — bigger games are far more kill/assist-rich, so a flat requirement made the item much stronger in big games. It ramps from **4 stacks** in small games up to **9 stacks** at 15+ players (4 → ≤4 players, 5 → 5–6, 6 → 7–8, 7 → 9–11, 8 → 12–14, 9 → 15+). Once you've banked enough for the current lobby you stay "armed" even if more players join, so a mid-game join can't rob a revive you already earned.
+* **Stacks persist across regular deaths** — only the revive consumes them. So if you die under-stacked, you keep your stacks and continue from there next life.
+* **How to get:** Unlock with Silver in the in-game Armory (1,500 Silver)
+* **Visual:** Skull necklace icon in your hero's HUD inventory slot with a stack counter (`X/N`, where N is the current requirement) that glows gold when you're armed.
+
+### Heavy Morning Star
+
+A heavy spiked mace that bonks enemy heroes for a brief stun on hit. Your standard attack rolls a stun chance every time it lands on an opposing hero.
+
+* **Effect:** Each hero-on-hero hit has a chance to **stun the victim for 2 seconds** — sprite freezes, can't move, can't attack, can't auto-cast. Stun chance is **20% for melee heroes, 12.5% for ranged/mage** (since melee has to commit harder to land each hit).
+* **No effect against creeps, towers, or bases** — only hero PvP.
+* **Doesn't trigger on splash/AOE damage** — only the primary swing or arrow. Cleave splash, fireball AOE, Volley extras, and thorns reflects don't roll stun.
+* **Can't re-stun an already-stunned hero** (prevents stun-lock). Once the 2-second stun expires, the next hit can stun again.
+* **How to get:** Free — every player owns it from the start
+* **Visual:** Spiked mace icon in your hero's HUD inventory slot. Stunned victims show a pulsing yellow tint + bobbing ⚡ icon above their head.
+
+### Blink Dagger
+
+A short-range emergency teleport that auto-procs when an enemy hero damages you. Strong reactive defense for squishy backline heroes.
+
+* **Effect:** When an enemy hero deals damage to you (auto-attack OR spell), instantly teleport **150px backward** (away from the attacker) and **fully dodge that damage**. Goes on a **20-second cooldown**. Only enemy *hero* damage procs it — creep and tower hits don't.
+* **How to get:** Unlock with Silver in the in-game Armory (2,000 Silver)
+* **Visual:** Dagger icon in your hero's HUD inventory slot with a cooldown spinner + seconds remaining. The blink itself is a neon teal-and-pink poof at origin and destination.
+
+### Yerba Berserker Mate
+
+A gourd of yerba-fueled focus that grants flat **[Ability Haste](#ability-haste)** — every one of your hero's ability cooldowns is shortened by a small percentage, always on, no active to manage.
+
+* **Effect:** **+10 Ability Haste** (passive). Shortens every hero ability cooldown — including Recall, Sprint and Stroll — by roughly 9%. Uses the standard LoL haste formula: `effective_cd = base_cd × 100 / (100 + haste)`. At 10 haste a 12s Earthquake becomes 10.9s; a 120s Recall becomes 109.1s. See [Ability Haste](#ability-haste) for the math + which abilities are affected.
+* **How to get:** Unlock with Silver in the in-game Armory (1,500 Silver)
+* **Visual:** Yerba gourd icon in your hero's HUD inventory slot. Tooltip cooldown numbers update to show the shortened values while equipped, and the HUD ability spinners visibly sweep faster.
+
+### Cat Ears
+
+Fluffy feline ears that periodically **charm** an enemy hero — Ahri-style crowd control.
+
+* **Effect:** Every **20 seconds**, auto-casts Charm at the nearest enemy hero within **150px**. The charmed hero crawls toward you at **20% speed for 2 seconds**, fully locked out — can't attack, cast, or proc anything (cooldowns frozen). A hero mid-Recall is immune (recall = invulnerability) and never interrupted.
+* **How to get:** Unlock with Silver in the in-game Armory (1,600 Silver)
+* **Visual:** Cat ears icon in your hero's HUD inventory slot with a cooldown spinner. Charmed victims float pink hearts and a "Charmed" label above their head.
+
+## Skins & Cosmetics
+
+Skins reskin your hero's sprite — but they often do **more than just visuals**. Most skins swap out one of the class's standard abilities for a custom variant with different mechanics and tradeoffs (usually stronger, sometimes with a cost). Read each skin carefully before equipping.
+
+### Vanguard (Melee)  *— free for everyone*
+
+The default melee skin, free for everyone. Replaces the standard Footman/Grunt sprite with the Vanguard look.
+
+* Free — no unlock required
+* **Replaces Fortitude → Defensive Aura** (see ability details below)
+* Equipped via the in-game Armory
+
+**Defensive Aura** (replaces Fortitude): instead of granting your hero a personal HP bonus, it projects a damage-reduction aura. All allied units (heroes + creeps) take **−16% / −22% / −28% / −36% damage** at level 1/2/3/4, within a radius that **grows with level — 200 / 250 / 300 / 350px**. Doesn't stack with other Vanguards — highest single source applies. Trade your personal tankiness for team-wide protection. Frontline tank flavor.
+
+### Space Marine (Ranged)
+
+A sci-fi reskin of the Ranged hero. Replaces the Archer (human) or Troll (orc) sprite with a Space Marine.
+
+* New laser sound effect on attacks
+* Faction-themed color (blue for human, red for orc)
+* **Replaces Bloodlust → Stim Pack** (see ability details below)
+* **How to get:** Unlock with Silver in the in-game Armory (2,000 Silver)
+
+**Stim Pack** (replaces Bloodlust): activates 3× attack speed and +25% movement speed, but costs 5% max HP per activation and requires at least 6% HP to use. Same 15-second cooldown and duration scaling as Bloodlust (5/6/7/8s per level). Significantly stronger than Bloodlust's 2× attack speed — at the cost of self-damage.
+
+### Dark Archer (Ranged)
+
+A dark, mysterious rogue archer skin for the Ranged hero. Replaces the Archer (human) or Troll (orc) sprite with the Dark Archer.
+
+* Blood-red arrows (replaces faction color tint)
+* Smoke-puff death effect
+* **Replaces Fortitude → Soul Harvest** (see ability details below)
+* **How to get:** Unlock with Silver in the in-game Armory (2,000 Silver)
+
+**Soul Harvest** (replaces Fortitude): heal-on-kill plus a stacking damage buff. Last-hit kills restore HP — **+25 / +40 / +60 / +80 HP per creep**, **+75 / +120 / +180 / +240 HP per hero** at level 1/2/3/4 — and grant a "soul" stack worth **+2% attack damage**. Stack cap scales per level: **10 / 12 / 14 / 16**. Stacks reset on death. Snowballs on kill streaks; a clean death resets you. Stack count is shown on the ability icon.
+
+### Centaur (Ranged) *— free for everyone*
+
+A half-horse forest-archer skin for the Ranged hero, free for everyone. Replaces the Archer (human) or Troll (orc) sprite with a Centaur — blue for humans, red for orcs (the orc variant is recolored at load, no second download).
+
+* Free — no unlock required
+* **Replaces Fortitude → Bramble Patch** (see ability details below)
+* **Class:** Ranged only
+
+**Bramble Patch** (replaces Fortitude): instead of a passive HP bonus, this is an **autocast summon**. When an enemy is near, the Centaur plants a **thorn bush** just in front of them (offset toward you, not directly on top) that lasts **8 seconds** and **blocks movement** (units path around it). Every second the bush fires **two bolts**:
+
+| Level | Heal bolt (ally HP) | Thorn bolt (enemy dmg) | Cooldown |
+| ----- | ------------------- | ---------------------- | -------- |
+| 1     | 25                  | 25                     | 15s      |
+| 2     | 40                  | 40                     | 15s      |
+| 3     | 55                  | 55                     | 15s      |
+| 4     | 70                  | 70                     | 15s      |
+
+The heal bolt seeks your **closest wounded ally hero**; the thorn bolt seeks the **closest enemy** and **slows it 30% for 1.5s** on hit. Both scale **+2.5% per hero level**. A support/zoning tool — sustain your team while pressuring enemies from a bush that also walls off ground.
+
+### Treant (Melee)
+
+An ancient forest guardian skin for the Melee hero. Replaces the Knight (human) or Death Knight (orc) sprite with a Treant. Same sprite for both factions (blue-tinted for humans, red-tinted for orcs).
+
+* **Replaces Fury → Earthquake** (see ability details below)
+* **How to get:** Unlock with Silver in the in-game Armory (2,000 Silver)
+* **Class:** Melee only
+
+**Earthquake** (replaces Fury): instead of a passive damage bonus, Earthquake is an **autocast active ability**. When a nearby enemy is within **180px**, the Treant automatically **dashes through the enemy** at high speed (800px/s), landing behind them. Upon landing, a **pulsing damage ring** follows the Treant, dealing AOE damage in a **150px radius** to all enemies caught inside. The ring pulses once per second:
+
+| Level | Damage per Pulse | Total Pulses | Cooldown |
+| ----- | ---------------- | ------------ | -------- |
+| 1     | 15               | 4            | 12s      |
+| 2     | 34               | 4            | 12s      |
+| 3     | 54               | 4            | 12s      |
+| 4     | 73               | 4            | 12s      |
+
+Damage scales with hero level (+2.5% per level). The dash can't be interrupted by stuns once started, but **recalling cancels the quake** (the ring follows the caster, so it would otherwise teleport to base mid-channel). A more aggressive, high-skill alternative to the passive Fury — strong against clumped enemies but requires you to commit to the frontline.
+
+### Throne of Bones (Mage) *— free for everyone*
+
+A necromancer-mage skin for the Mage hero, free for everyone. Replaces the Mage (human) or Ogre-Mage (orc) sprite with the Throne of Bones, and fires a bone projectile for its basic attack and Fireball.
+
+* Free — no unlock required
+* **Replaces Fury → Skeleton Archer** (see ability details below)
+* **Class:** Mage only
+
+**Skeleton Archer** (replaces Fury): instead of a passive damage bonus, this is an **autocast summon**. Every **12 seconds** the Throne raises a **skeleton archer** that moves at hero speed, **follows you around**, and shoots enemies within **130px** with arrows (shorter than your own range, so they push out in front and tank). **Up to 3 can be alive at once.**
+
+| Level | Skeleton HP | Arrow Damage | Cooldown | Max Alive |
+| ----- | ----------- | ------------ | -------- | --------- |
+| 1     | 180         | 18           | 12s      | 3         |
+| 2     | 260         | 26           | 12s      | 3         |
+| 3     | 340         | 34           | 12s      | 3         |
+| 4     | 420         | 44           | 12s      | 3         |
+
+The archers are **leashed** to you — they'll step off to shoot a nearby enemy but won't chase far, and snap back if you move away. They **recall to base with you**, and **die when you die** (your next life summons a fresh set). A persistent-pressure alternative to the passive Fury — your own mobile firing squad.
+
+## Future Items
+
+The Armory will expand with more cosmetics and equipment over time. Planned additions include:
+
+* New skins for melee and mage heroes
+* Themed skin sets
+* Additional equipment with strategic effects
+
+The community will help shape what gets added next. See the [Roadmap](#roadmap) for more.
+
+
+---
+
+# Tech Stack
+
+Throne Wars is built entirely in TypeScript across the full stack.
+
+**Server** — A Node.js server runs the game simulation at 20 ticks per second. It handles all game logic — unit movement, combat, abilities, and win conditions. Nothing runs on the client.
+
+**Client** — A browser-based spectator view built with Phaser 3. It connects to the server via WebSocket, receives the game state 20 times per second, and renders everything you see — units marching, heroes fighting, towers falling. It has no game logic of its own.
+
+**Database** — PostgreSQL stores player accounts, MMR, match history, and Silver balances.
+
+**Hosting** — The front end is hosted on Vercel, the game server runs on DigitalOcean.
+
+
+---
+
+# Roadmap
+
+## The Vision
+
+Growing up, I was heavily inspired by Warcraft 3 custom maps — simple, creative, endlessly replayable games built on top of a shared engine. I see this initial MVP as the first custom map. A starting point. There's enormous potential to build a fledgling ecosystem of pixel RTS-style games on top of this engine.
+
+But first and foremost, the goal is simple: build a game that's actually fun and interesting to watch and play. Everything else follows from that.
+
+## What's Next
+
+**Short term — Polish & seasons**
+
+* Refine balance, hero abilities, and lane dynamics based on player feedback
+* Improve the spectator experience and mobile UX
+* Launch the first **ranked season** with a defined start/end date
+* Grow the community of players competing in the arena
+
+**Medium term — Progression & the Armory**
+
+* Expand the **Armory** with more skins, equipment, and themed cosmetic sets
+* More ways to earn and spend **Silver**
+
+**Long term — Expand the ecosystem**
+
+* New game modes and maps — the first of many "custom maps" in the Throne Wars universe
+* More hero classes, unit types, and ability trees
+* iOS app — a native mobile experience
+* Community-driven development — players help shape what gets built next
+
+## Seasons
+
+We're moving toward a **seasonal ranked structure**, similar to traditional MOBAs. Each season:
+
+* Lasts a defined window (e.g. 4–6 weeks)
+* Resets MMR at the end, snapshotting final standings on the leaderboard
+
+The goal is **organic, competitive gameplay** — enough on the line to make climbing the ladder meaningful.
+
+## How We Build
+
+This is a community-driven project. We'll iterate based on real feedback from the people playing the game. No bloated roadmap with dates we can't hit. We ship, we listen, we improve.
+
+
+---
+
+# Team
+
+## AzFlin — Founder & Developer
+
+[Twitter/X](https://x.com/AzFlin)
+
+Throne Wars is a solo project built by AzFlin.
+
+Full stack software engineer with years of experience founding and shipping products, including [daos.world](https://daos.world/).
+
+Lifelong gamer — grew up on Blizzard titles like Warcraft 3, StarCraft 2, and Diablo 2. Now channeling that into a new passion for building games. Throne Wars is the result of combining that gaming background with years of shipping software.
+
+
+---
+
