@@ -5,36 +5,36 @@
  * tower juke, base dance, recall doctrine — all inherited unchanged). Only the
  * NETWORKING differs, because Throne Wars (thronewars.gg) is web2 with NO login:
  *
- *   - Identity is SERVER-ASSIGNED (e.g. "SilentDrake137"). There is no API key.
- *     We create a session on first contact, keep its cookie, and read back our
- *     assigned name from the game state (whoever appears that we didn't already
- *     know = us, confirmed by matching our chosen lane/class).
- *   - Endpoints are AUTO-DISCOVERED at boot: the player-facing docs don't list
- *     them, so we probe a set of candidate REST bases / paths / WS hosts (all
- *     built from the same dev's DoA shapes) and lock onto whatever answers.
- *   - Rooms use ?room=N. For an 18-bot party, force one room so they fill it.
+ * - Identity is SERVER-ASSIGNED (e.g. "SilentDrake137"). There is no API key.
+ * We create a session on first contact, keep its cookie, and read back our
+ * assigned name from the game state (whoever appears that we didn't already
+ * know = us, confirmed by matching our chosen lane/class).
+ * - Endpoints are AUTO-DISCOVERED at boot: the player-facing docs don't list
+ * them, so we probe a set of candidate REST bases / paths / WS hosts (all
+ * built from the same dev's DoA shapes) and lock onto whatever answers.
+ * - Rooms use ?room=N. For an 18-bot party, force one room so they fill it.
  *
  * Because the API is unverified (alpha, no bot docs), the discovery layer logs
  * exactly what it found; if a probe path is wrong, the log tells us what to fix.
  *
  * ENV (all optional):
- *   TW_BASE         override REST base (skip discovery), e.g. https://thronewars.gg
- *   TW_WS           override WS url,   e.g. wss://thronewars.gg
- *   TW_ROOM         force a room number (all instances -> same room = a party)
- *   TW_NAME         desired name hint (server may override / ignore)
- *   TW_CLASS        mage | melee | ranged   (default mage)
- *   TW_SKIN         skin id (default: none — base mage)
- *   TW_ITEM         item id (default: ring_of_regen; free for everyone here)
- *   TW_LANE         top | mid | bot  (default mid)
- *   TW_INSTANCES    launch N in-process bots from ONE command (default 1)
- *   TW_JOIN_STAGGER ms between staggered instance joins (default 1500)
- *   DEBUG=1 / --debug
+ * TW_BASE         override REST base (skip discovery), e.g. https://thronewars.gg
+ * TW_WS           override WS url,   e.g. wss://thronewars.gg
+ * TW_ROOM         force a room number (all instances -> same room = a party)
+ * TW_NAME         desired name hint (server may override / ignore)
+ * TW_CLASS        mage | melee | ranged   (default mage)
+ * TW_SKIN         skin id (default: none — base mage)
+ * TW_ITEM         item id (default: ring_of_regen; free for everyone here)
+ * TW_LANE         top | mid | bot  (default mid)
+ * TW_INSTANCES    launch N in-process bots from ONE command (default 1)
+ * TW_JOIN_STAGGER ms between staggered instance joins (default 1500)
+ * DEBUG=1 / --debug
  *
  * Run one:   npx tsx thronebot.ts
  * Run a party of 18 (this file re-launches itself as 18 child processes):
- *            TW_INSTANCES=18 TW_ROOM=1 npx tsx thronebot.ts
+ * TW_INSTANCES=18 TW_ROOM=1 npx tsx thronebot.ts
  * (Each child is its own OS process = its own session/name, exactly how the game
- *  sees 18 real players. You can also launch 18 terminals by hand with same TW_ROOM.)
+ * sees 18 real players. You can also launch 18 terminals by hand with same TW_ROOM.)
  */
 
 import "dotenv/config";
@@ -47,41 +47,9 @@ import { fileURLToPath } from "node:url";
 // ESM has no __filename; derive it so we can re-launch this file as children.
 const SELF_PATH = fileURLToPath(import.meta.url);
 
-// ===== Multi-instance fan-out: if asked for N>1 and we're the parent, spawn N
-// children (each a normal single bot) with staggered joins, then do nothing else.
 const _INSTANCES = Math.max(1, parseInt(process.env.TW_INSTANCES ?? "1", 10) || 1);
 const _STAGGER = parseInt(process.env.TW_JOIN_STAGGER ?? "1500", 10) || 1500;
 const _IS_PARENT = _INSTANCES > 1 && !process.env.TW_CHILD;
-if (_IS_PARENT) {
-    console.log(`[party] launching ${_INSTANCES} bots into room ${process.env.TW_ROOM ?? "(auto)"} …`);
-    for (let i = 0; i < _INSTANCES; i++) {
-        setTimeout(() => {
-            const botNumber = i + 1;
-            const auth = process.env[`TW_AUTH_${botNumber}`] || process.env.TW_AUTH || "";
-            const name = process.env[`TW_NAME_${botNumber}`] || process.env.TW_NAME || "";
-            if (!auth) {
-                console.log(`[party] bot #${botNumber} has NO token (set TW_AUTH_${botNumber}=Bearer <uuid> in .env) — skipping`);
-                return;
-            }
-            if (!name) {
-                console.log(`[party] WARN bot #${botNumber} has no TW_NAME_${botNumber} — falling back to fuzzy self-ID, which is unreliable when bots share a lane/class.`);
-            }
-            const child = spawn(process.execPath, ["--import", "tsx", SELF_PATH], {
-                stdio: "inherit",
-                env: {
-                    ...process.env,
-                    TW_CHILD: String(botNumber),
-                    TW_INSTANCES: "1",
-                    // Each bot gets ITS OWN token + server-assigned username, so the
-                    // in-game identity is exact (no class/lane guessing collisions).
-                    TW_AUTH: auth,
-                    TW_NAME: name,
-                },
-            });
-            child.on("exit", (c) => console.log(`[party] bot #${botNumber} (${name || "unnamed"}) exited (${c})`));
-        }, i * _STAGGER);
-    }
-}
 
 // ----------------------------- Config ----------------------------------------
 
@@ -103,8 +71,8 @@ const DEF_LANE = (process.env.TW_LANE as Lane) || "mid";
 // Discovered/session state (filled by discover()).
 let REST_BASE = process.env.TW_BASE || "";
 let WS_URL = process.env.TW_WS || "";
-let STATE_PATH = "/api/game/state";
-let DEPLOY_PATH = "/api/strategy/deployment";
+let STATE_PATH = process.env.TW_STATE_PATH || "/api/game/state";
+let DEPLOY_PATH = process.env.TW_DEPLOY_PATH || "/api/strategy/deployment";
 let COOKIE = "";                        // session cookie jar for this process
 let AGENT_NAME = process.env.TW_NAME || ""; // learned from state if server-assigned
 let ROOM: number | null = FORCED_ROOM;
@@ -338,7 +306,6 @@ let prefIdx = 0;
 let skinGranted = true;
 let roundOverAt = 0;
 
-let lastWsSendAt = 0;
 let lastRestPostAt = 0;
 let restBackoffUntil = 0;
 
@@ -652,8 +619,11 @@ function captureCookie(r: Response) {
 const actionRejected = (res: RestResult, action: string) =>
     !res.ok || (!!res.warning && new RegExp(action, "i").test(res.warning));
 
-async function pollRest() {
+async function slowRestFallback() {
+    if (process.env.TW_ORACLE) return; // Parent Oracle handles REST completely
     if (restPolling) return;
+    if (live()) return; // GUARD: WS is alive
+
     restPolling = true;
     try {
         const q = ROOM !== null ? `?room=${ROOM}` : "";
@@ -661,49 +631,47 @@ async function pollRest() {
         captureCookie(r);
         if (!r.ok) { console.log(`[rest] state ${r.status}`); return; }
         rest = (await r.json()) as RestState;
-
-        if (rest.winner) {
-            if (!roundOverAt) {
-                roundOverAt = now();
-                console.log(`[round] over — ${rest.winner} won. Rejoining next round…`);
-            }
-            resetRoundState();
-            return;
-        }
-        if (roundOverAt && now() - roundOverAt < CFG.rejoinDelayMs) return;
-        roundOverAt = 0;
-
-        // Identity. If TW_NAME was provided (the real server-assigned username for
-        // this token), it is AUTHORITATIVE — never let fuzzy class+lane guessing
-        // override it, which is what caused bots to swap identities on relaunch.
-        if (!AGENT_NAME && !process.env.TW_NAME) {
-            const mine = identifySelf(rest.heroes);
-            if (mine) { AGENT_NAME = mine; console.log(`[id] self-identified (fuzzy) as: ${AGENT_NAME}`); }
-        } else if (!joinedConfirmed && AGENT_NAME && !rest.heroes.some((h) => h.name === AGENT_NAME)) {
-            // Named but not yet on the board — just waiting for our deploy to land.
-        }
-
-        const meR = rest.heroes.find((h) => h.name === AGENT_NAME);
-        if (meR) {
-            if (!joinedConfirmed) {
-                const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
-                console.log(`[join] confirmed: ${meR.faction} ${meR.class} in ${meR.lane} as ${AGENT_NAME} (requested: ${pref.label})`);
-            }
-            joinedConfirmed = true;
-            myFaction = meR.faction;
-            if (now() - lastLaneCmdAt > 3500) serverLane = meR.lane;
-            if (typeof meR.recallCooldownMs === "number" && meR.recallCooldownMs > 0)
-                cd.recall = Math.max(cd.recall, now() + meR.recallCooldownMs);
-            if (!live() && meR.alive) recordHp(meR.hp, meR.maxHp);
-            await pickIfPending(meR.class, meR.abilities as Ability[], meR.abilityChoices);
-        } else {
-            joinedConfirmed = false;
-            await maybeDeploy();
-        }
+        processRestSideEffects();
     } catch (e) {
         console.log("[rest] poll error:", (e as Error).message);
     } finally {
         restPolling = false;
+    }
+}
+
+function processRestSideEffects() {
+    if (rest?.winner) {
+        if (!roundOverAt) {
+            roundOverAt = now();
+            console.log(`[round] over — ${rest.winner} won. Rejoining next round…`);
+        }
+        resetRoundState();
+        return;
+    }
+    if (roundOverAt && now() - roundOverAt < CFG.rejoinDelayMs) return;
+    roundOverAt = 0;
+}
+
+async function lifecycleTick() {
+    // Determine our hero from whichever data source is currently active (WS or REST)
+    const me = meView();
+
+    if (me) {
+        if (!joinedConfirmed) {
+            const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
+            console.log(`[join] confirmed: ${me.faction} ${me.heroClass} in ${me.lane} as ${AGENT_NAME}`);
+        }
+        joinedConfirmed = true;
+        myFaction = me.faction;
+        if (now() - lastLaneCmdAt > 3500) serverLane = me.lane;
+
+        // Sync abilities if pending
+        if (me.abilityChoices && me.abilityChoices.length > 0) {
+            await pickIfPending(me.heroClass, me.abilities, me.abilityChoices);
+        }
+    } else {
+        joinedConfirmed = false;
+        await maybeDeploy();
     }
 }
 
@@ -825,19 +793,28 @@ function wsConnect() {
     ws = new WebSocket(`${host}/${q}`, COOKIE ? { headers: { Cookie: COOKIE } } : undefined);
 
     const watchdog = setTimeout(() => {
-        if (!gotSnapshotThisConn) {
+        if (!gotSnapshotThisConn && !process.env.TW_ORACLE) {
             console.log(`[ws] no decodable snapshots from ${host} — retrying (REST keeps playing)`);
             try { ws?.close(); } catch { }
         }
     }, CFG.wsWatchdogMs);
 
     ws.on("open", () => {
-        console.log(`[ws] connected: ${host}${q}`);
+        console.log(`[ws] connected: ${host}${q} (Child #${CHILD_ID})`);
+
+        if (process.env.TW_ORACLE) clearTimeout(watchdog);
+
         // TW is cookie-authenticated; send a room subscribe in case the server wants one.
-        try { ws!.send(JSON.stringify({ type: "subscribe", room: ROOM })); } catch { }
+        // ORACLE FIX: Skip subscribing on children to radically slash game server bandwidth
+        if (!process.env.TW_ORACLE) {
+            try { ws!.send(JSON.stringify({ type: "subscribe", room: ROOM })); } catch { }
+        }
     });
 
     ws.on("message", (data: WebSocket.RawData) => {
+        // ORACLE FIX: Let the centralized parent parse the feed. Save 19x zlib/JSON.parse cycles.
+        if (process.env.TW_ORACLE) return;
+
         wsFrames++;
         const buf = Array.isArray(data) ? Buffer.concat(data as Buffer[])
             : Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
@@ -868,6 +845,8 @@ function wsConnect() {
 
 let schemaDumped = false;
 function onWsSnapshot(s: any, rawText: string) {
+    if (process.env.TW_ORACLE) return; // Handled by IPC
+
     const units = (s.units as any[]).map(adaptUnit).filter((u): u is U => !!u);
     const blds = ((s.buildings ?? []) as any[]).map(adaptBuilding).filter((b): b is Bld => !!b);
     const sb = ((s.heroScoreboard ?? []) as any[]).map(adaptScore).filter((e): e is ScoreEntry => !!e);
@@ -883,6 +862,10 @@ function onWsSnapshot(s: any, rawText: string) {
         }
     }
 
+    processWsSideEffects();
+}
+
+function processWsSideEffects() {
     const me = mySb();
     if (me) {
         myFaction = me.faction;
@@ -902,11 +885,8 @@ async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
     if (!ready(kind) || channelingRecall()) return false;
     const prev = cd[kind];
     cd[kind] = now() + (kind === "sprint" ? CFG.sprintCdMs : CFG.strollCdMs);
-    if (live() && ws?.readyState === WebSocket.OPEN && now() - lastWsSendAt >= CFG.wsSendGapMs) {
-        ws.send(JSON.stringify({ type: kind })); lastWsSendAt = now();
-        console.log(`[act] ${kind}`);
-        return true;
-    }
+
+    // Explicitly stripping WS actions to avoid silent failures - properly routing to REST
     const res = await restPost({ action: kind });
     if (actionRejected(res, kind)) {
         if (!res.warning) cd[kind] = prev;
@@ -922,11 +902,8 @@ async function sendRecall(reason: string): Promise<boolean> {
     const prev = cd.recall;
     cd.recall = now() + CFG.recallCdMs;
     lastRecallAt = now();
-    if (live() && ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "recall" }));
-        console.log(`[act] recall (${reason})`);
-        return true;
-    }
+
+    // Explicitly stripping WS actions to avoid silent failures - properly routing to REST
     const res = await restPost({ action: "recall" }, { urgent: true });
     if (actionRejected(res, "recall")) {
         if (!res.warning) { cd.recall = prev; lastRecallAt = 0; }
@@ -950,17 +927,13 @@ async function commandLane(lane: Lane, reason: string, opts: { sprint?: boolean;
     lastLaneCmdAt = now();
 
     const wantSprint = !!opts.sprint && ready("sprint") && !channelingRecall();
-    let ok = false;
-    if (live() && ws?.readyState === WebSocket.OPEN && now() - lastWsSendAt >= CFG.wsSendGapMs) {
-        ws.send(JSON.stringify({ type: "switchLane", lane })); lastWsSendAt = now(); ok = true;
-        if (wantSprint) setTimeout(() => { void sendMovement("sprint"); }, 250);
-    } else {
-        const body: Record<string, any> = { heroLane: lane };
-        if (wantSprint) { body.action = "sprint"; cd.sprint = now() + CFG.sprintCdMs; }
-        const res = await restPost(body, { urgent: !!opts.emergency });
-        ok = res.ok;
-    }
-    if (ok) {
+
+    // Explicitly stripping WS actions to avoid silent failures - properly routing to REST
+    const body: Record<string, any> = { heroLane: lane };
+    if (wantSprint) { body.action = "sprint"; cd.sprint = now() + CFG.sprintCdMs; }
+    const res = await restPost(body, { urgent: !!opts.emergency });
+
+    if (res.ok) {
         console.log(`[act] lane ${committed}->${lane} (${reason})${wantSprint ? " +sprint" : ""}`);
     } else {
         currentLaneTarget = prevTarget;
@@ -1465,24 +1438,16 @@ async function macro() {
     }
 }
 
-// ----------------------------- Heartbeat & boot ---------------------------------
-
-setInterval(() => {
-    if (!joinedConfirmed) return;
-    const me = meView();
-    if (!me) return;
-    const mode = live() ? "LIVE(20Hz+pos)" : "REST(1.5s)";
-    console.log(
-        `[status] mode=${mode} class=${me.heroClass}${currentSkin(me) ? `/${currentSkin(me)}` : ""} lane=${serverLane ?? "?"} lvl=${me.level} hp=${(hpFracOf(me) * 100) | 0}%` +
-        ` recall=${ready("recall") ? "ready" : Math.ceil((cd.recall - now()) / 1000) + "s"} wsFrames=${wsFrames}`
-    );
-}, 30_000);
-
 // ----------------------------- Discovery + boot --------------------------------
 
 // Find a REST base + state path that returns a game-state-shaped JSON, and a
 // working WS url. Falls back to overrides (TW_BASE/TW_WS) without probing.
 async function discover(): Promise<boolean> {
+    if (process.env.TW_ORACLE) {
+        // Child instance utilizing Oracle. Endpoints are inherited via ENV.
+        return true;
+    }
+
     // If a room isn't forced, we still try each base's state with no room (server
     // may return a default/lobby); once deployed the state reflects our room.
     for (const base of REST_CANDIDATES) {
@@ -1529,27 +1494,184 @@ async function discover(): Promise<boolean> {
     return false;
 }
 
-async function main() {
-    console.log(`[boot] thronebot #${CHILD_ID}${AGENT_NAME ? ` "${AGENT_NAME}"` : ""} | room ${ROOM ?? "(discover)"} | ${DEF_CLASS}${DEF_SKIN ? "/" + DEF_SKIN : ""} @ ${DEF_LANE} | item ${DEF_ITEM} | token ${process.env.TW_AUTH ? "set" : "MISSING"}${DEBUG ? " | DEBUG" : ""}`);
+// ----------------------------- Network Topology Core ---------------------------
+
+async function runOracleParent() {
+    console.log(`[party] discovering endpoints once for the party...`);
     const ok = await discover();
     if (!ok) {
-        console.error("[boot] could not discover a Throne Wars API endpoint. Set TW_BASE (and TW_WS) explicitly — open thronewars.gg devtools → Network to find the host, e.g. TW_BASE=https://thronewars.gg");
+        console.error("[party] discovery failed. Provide TW_BASE/TW_WS overrides.");
         process.exit(1);
     }
-    wsConnect();
-    // Every bot must poll: pollRest is where THIS bot deploys itself, confirms its
-    // own identity, and picks its own abilities. (Sharing one poll across children
-    // is why only bot #1 ever joined — the others never deployed.) The poll is light;
-    // the 20 Hz WS feed remains the primary world model for decisions.
-    setInterval(pollRest, CFG.restPollMs);
-    setInterval(() => {
-        if (macroBusy) return;
-        macroBusy = true;
-        macro().catch((e) => console.log("[macro] error:", (e as Error).message)).finally(() => { macroBusy = false; });
-    }, CFG.macroMs);
-    void pollRest();
+    console.log(`[party] launching ${_INSTANCES} bots into room ${ROOM ?? "(auto)"} …`);
+
+    const children: import("child_process").ChildProcess[] = [];
+    for (let i = 0; i < _INSTANCES; i++) {
+        setTimeout(() => {
+            const botNumber = i + 1;
+            const auth = process.env[`TW_AUTH_${botNumber}`] || process.env.TW_AUTH || "";
+            const name = process.env[`TW_NAME_${botNumber}`] || process.env.TW_NAME || "";
+
+            if (!auth) {
+                console.log(`[party] bot #${botNumber} has NO token — skipping`);
+                return;
+            }
+
+            const child = spawn(process.execPath, ["--import", "tsx", SELF_PATH], {
+                stdio: ["inherit", "inherit", "inherit", "ipc"],
+                env: {
+                    ...process.env,
+                    TW_CHILD: String(botNumber),
+                    TW_INSTANCES: "1",
+                    TW_AUTH: auth,
+                    TW_NAME: name,
+                    TW_BASE: REST_BASE,
+                    TW_WS: WS_URL,
+                    TW_STATE_PATH: STATE_PATH,
+                    TW_DEPLOY_PATH: DEPLOY_PATH,
+                    TW_ORACLE: "1", // Triggers IPC listener mode in children
+                },
+            });
+            child.on("exit", (c) => console.log(`[party] bot #${botNumber} (${name || "unnamed"}) exited (${c})`));
+            children.push(child);
+        }, i * _STAGGER);
+    }
+
+    // 1. Oracle REST Poller (Eliminates 18 redundant REST queries)
+    setInterval(async () => {
+        try {
+            const q = ROOM !== null ? `?room=${ROOM}` : "";
+            const r = await fetch(`${REST_BASE}${STATE_PATH}${q}`);
+            if (!r.ok) return;
+            const restData = await r.json();
+            children.forEach(c => c.send({ type: "rest", payload: restData }));
+        } catch (e) { }
+    }, CFG.restPollMs);
+
+    // 2. Oracle WS Poller (Eliminates 18 redundant JSON.parse & gunzip cycles)
+    let oracleWsConn: WebSocket | null = null;
+    function connectOracleWs() {
+        const host = WS_URL;
+        const q = ROOM !== null ? `?room=${ROOM}` : "";
+        oracleWsConn = new WebSocket(`${host}/${q}`);
+
+        oracleWsConn.on("open", () => {
+            console.log(`[oracle] WS connected: ${host}${q} (State Oracle active)`);
+            try { oracleWsConn!.send(JSON.stringify({ type: "subscribe", room: ROOM })); } catch { }
+        });
+
+        oracleWsConn.on("message", (data: WebSocket.RawData) => {
+            const buf = Array.isArray(data) ? Buffer.concat(data as Buffer[])
+                : Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+            const text = decodeFrame(buf);
+            if (!text) return;
+            try {
+                const s = JSON.parse(text);
+                if (s && Array.isArray(s.units)) {
+                    const units = (s.units as any[]).map(adaptUnit).filter((u): u is U => !!u);
+                    const blds = ((s.buildings ?? []) as any[]).map(adaptBuilding).filter((b): b is Bld => !!b);
+                    const sb = ((s.heroScoreboard ?? []) as any[]).map(adaptScore).filter((e): e is ScoreEntry => !!e);
+
+                    // Share deserialized javascript object; much cheaper IPC than massive JSON raw strings
+                    const WPayload = { units, blds, sb, winner: s.winner ?? null };
+                    children.forEach(c => {
+                        try { c.send({ type: "ws", payload: WPayload }); } catch { }
+                    });
+                }
+            } catch { }
+        });
+
+        oracleWsConn.on("close", () => {
+            setTimeout(connectOracleWs, 1500);
+        });
+        oracleWsConn.on("error", (e) => console.log("[oracle] ws error:", (e as Error).message));
+    }
+    connectOracleWs();
 }
 
-// Entrypoint dispatch — runs LAST, so every top-level const above is initialized.
-// Parent (multi-instance supervisor) already spawned children and does nothing here.
-if (!_IS_PARENT) void main();
+async function runBot() {
+    console.log(`[boot] thronebot #${CHILD_ID}${AGENT_NAME ? ` "${AGENT_NAME}"` : ""} | room ${ROOM ?? "(discover)"} | ${DEF_CLASS}${DEF_SKIN ? "/" + DEF_SKIN : ""} @ ${DEF_LANE} | item ${DEF_ITEM} | token ${process.env.TW_AUTH ? "set" : "MISSING"}${DEBUG ? " | DEBUG" : ""}`);
+
+    const ok = await discover();
+    if (!ok) {
+        console.error("[boot] could not discover a Throne Wars API endpoint.");
+        process.exit(1);
+    }
+
+    // Oracle architectural upgrade: 
+    // If the Oracle is running, children don't even need to open a WebSocket connection!
+    // This saves 18 unnecessary socket connections to the game server.
+    if (!process.env.TW_ORACLE) {
+        wsConnect();
+    }
+
+    // 1. IPC Listener (replaces native network fetching if Oracle is running)
+    if (process.env.TW_ORACLE) {
+        process.on("message", (msg: any) => {
+            if (msg.type === "ws") {
+                wsFrames++;
+                W = msg.payload;
+                lastWsSnapshotAt = now();
+                processWsSideEffects();
+            } else if (msg.type === "rest") {
+                rest = msg.payload;
+                processRestSideEffects();
+            }
+        });
+    }
+
+    // Generate unique numerical offset based on CHILD ID to naturally batch bursts across instances
+    const childIdNum = parseInt(CHILD_ID, 10) || 1;
+
+    // 2. Lifecycle Tick (Staggered to prevent 19x concurrent deploys/pick evaluations)
+    const lifecycleJitter = (childIdNum * 123) % 1500;
+    setTimeout(() => {
+        setInterval(lifecycleTick, 1500);
+        void lifecycleTick();
+    }, lifecycleJitter);
+
+    // 3. REST Backup Loop 
+    const restJitter = (childIdNum * 311) % CFG.restPollMs;
+    setTimeout(() => {
+        setInterval(slowRestFallback, CFG.restPollMs);
+        void slowRestFallback();
+    }, restJitter);
+
+    // 4. Macro Loop (Staggered micro-timing so logic evaluation doesn't overlap across bots)
+    const macroJitter = (childIdNum * 47) % CFG.macroMs;
+    setTimeout(() => {
+        setInterval(() => {
+            if (macroBusy) return;
+            macroBusy = true;
+            macro().catch((e) => console.log("[macro] error:", (e as Error).message)).finally(() => { macroBusy = false; });
+        }, CFG.macroMs);
+    }, macroJitter);
+
+    // 5. Heartbeat Log
+    setInterval(() => {
+        if (!joinedConfirmed) return;
+        const me = meView();
+        if (!me) return;
+        const mode = process.env.TW_ORACLE
+            ? (live() ? "IPC-LIVE" : "IPC-REST")
+            : (live() ? "LIVE(20Hz)" : "REST(1.5s)");
+        console.log(
+            `[status] mode=${mode} class=${me.heroClass}${currentSkin(me) ? `/${currentSkin(me)}` : ""} lane=${serverLane ?? "?"} lvl=${me.level} hp=${(hpFracOf(me) * 100) | 0}%` +
+            ` recall=${ready("recall") ? "ready" : Math.ceil((cd.recall - now()) / 1000) + "s"} wsFrames=${wsFrames}`
+        );
+    }, 30_000);
+}
+
+// ==============================================================================
+// ENTRYPOINT DISPATCH
+// ==============================================================================
+
+async function main() {
+    if (_IS_PARENT) {
+        await runOracleParent();
+    } else {
+        await runBot();
+    }
+}
+
+void main();
