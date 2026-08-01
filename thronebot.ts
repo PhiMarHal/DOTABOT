@@ -42,10 +42,13 @@ import WebSocket from "ws";
 import zlib from "node:zlib";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import path from "node:path";
 
-// ESM has no __filename; derive it so we can re-launch this file as children.
-const SELF_PATH = fileURLToPath(import.meta.url);
+// ESM has no __filename. We used to derive it from import.meta.url, but that
+// forces a "module": "es2020"+ tsconfig on anyone who opens this file, and the
+// only thing SELF_PATH is for is re-spawning this script as child processes in
+// party mode. argv[1] is exactly that path, and needs no compiler options.
+const SELF_PATH = process.argv[1] ? path.resolve(process.argv[1]) : "thronebot.ts";
 
 const _INSTANCES = Math.max(1, parseInt(process.env.TW_INSTANCES ?? "1", 10) || 1);
 const _STAGGER = parseInt(process.env.TW_JOIN_STAGGER ?? "1500", 10) || 1500;
@@ -56,17 +59,84 @@ const _IS_PARENT = _INSTANCES > 1 && !process.env.TW_CHILD;
 const CHILD_ID = process.env.TW_CHILD ?? "1";
 const DEBUG = process.env.DEBUG === "1" || process.env.DOTA_DEBUG === "1" || process.argv.includes("--debug");
 
+// --- FIX 1: credential resolution -------------------------------------------
+// The old build only read TW_AUTH / TW_NAME, which the *parent* sets for its
+// children out of TW_AUTH_<n>. Running a single bot (the normal case) therefore
+// went out with NO Authorization header and an EMPTY name: the server happily
+// created an anonymous session and spawned a hero under a name we never learned,
+// so we could never find ourselves in the state and re-deployed forever.
+// Resolve here, once, with fallbacks, and use these everywhere.
+const AUTH_TOKEN = (
+    process.env.TW_AUTH ||
+    process.env[`TW_AUTH_${CHILD_ID}`] ||
+    process.env.TW_AUTH_1 ||
+    ""
+).trim();
+// A raw UUID is accepted too — we add the "Bearer " prefix if it's missing.
+const AUTH_HEADER = AUTH_TOKEN
+    ? (/^bearer\s/i.test(AUTH_TOKEN) ? AUTH_TOKEN : `Bearer ${AUTH_TOKEN}`)
+    : "";
+const NAME_HINT = (
+    process.env.TW_NAME ||
+    process.env[`TW_NAME_${CHILD_ID}`] ||
+    process.env.TW_NAME_1 ||
+    ""
+).trim();
+
+// Headers used on every REST call (and the WS handshake).
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const h: Record<string, string> = { ...extra };
+    if (AUTH_HEADER) h["Authorization"] = AUTH_HEADER;
+    if (COOKIE) h["Cookie"] = COOKIE;
+    return h;
+}
+
 // Candidate hosts/paths probed at boot (same-dev DoA shapes are the template).
 const REST_CANDIDATES = [process.env.TW_BASE, "https://thronewars.gg", "https://api.thronewars.gg", "https://game.thronewars.gg", "https://server.thronewars.gg"].filter(Boolean) as string[];
 const WS_CANDIDATES = [process.env.TW_WS, "wss://thronewars.gg", "wss://api.thronewars.gg", "wss://game.thronewars.gg", "wss://server.thronewars.gg"].filter(Boolean) as string[];
 const STATE_PATHS = ["/api/game/state", "/api/state", "/api/room/state", "/state"];
 const DEPLOY_PATHS = ["/api/strategy/deployment", "/api/deployment", "/api/deploy", "/api/play"];
 
+// ==============================================================================
+//  LOADOUT — THE SOURCE OF TRUTH. Edit it here, in the file.
+//  .env holds secrets only (TW_AUTH_n / TW_NAME_n). Nothing below needs env.
+// ==============================================================================
+const LOADOUT = {
+    heroClass: "mage" as HeroClass,     // melee | ranged | mage
+    lane: "mid" as Lane,                // top | mid | bot — the lane we stack
+
+    // Skin. The ability build adapts to it automatically (see buildWants).
+    // Throne of Bones turns Fury into Skeleton Archers; free for everyone.
+    // Set to null for the plain class sprite.
+    //
+    // Skin IDS ARE NOT DOCUMENTED anywhere, so this is a list of spellings to
+    // try, best guess first. If one is silently ignored by the server the bot
+    // notices at join time and moves to the next on the following round, so a
+    // wrong guess costs one round, not the session.
+    skin: ["throne_of_bones", "throneofbones", "throne-of-bones", "bones"] as string[] | null,
+
+    // Item, in preference order. Cat Ears is the strongest thing available (2s
+    // full lockout on the nearest enemy hero, every 20s) but costs 1,600 Silver;
+    // Ring of Regen is free, so it's the floor. The deploy handler walks this
+    // list on an item rejection, and re-tries from the top every round — so the
+    // bot picks up Cat Ears by itself the round after you buy it.
+    items: ["cat_ears", "ring_of_regen", null] as (string | null)[],
+};
+
+// Per-class skin defaults, used only if LOADOUT.skin is left null but you still
+// want the free skin for whatever class you're running.
+//   melee -> Vanguard (Defensive Aura), ranged -> Centaur (Bramble Patch)
+
 const FORCED_ROOM = process.env.TW_ROOM ? parseInt(process.env.TW_ROOM, 10) : null;
-const DEF_CLASS = (process.env.TW_CLASS as HeroClass) || "mage";
-const DEF_SKIN = process.env.TW_SKIN || undefined;
-const DEF_ITEM = process.env.TW_ITEM || "ring_of_regen";
-const DEF_LANE = (process.env.TW_LANE as Lane) || "mid";
+const DEF_CLASS = LOADOUT.heroClass;
+const SKIN_CANDIDATES: string[] = LOADOUT.skin ?? [];
+const DEF_SKIN: string | undefined = SKIN_CANDIDATES[0];
+const DEF_ITEM = LOADOUT.items[0] ?? null;
+// The JSON field the server wants the skin under isn't documented either. If the
+// [join] loadout line shows the skin never applying under any id above, this is
+// the other knob to turn: "heroSkin", "skinId", "cosmetic".
+const SKIN_KEY = "skin";
+const DEF_LANE = LOADOUT.lane;
 
 // Discovered/session state (filled by discover()).
 let REST_BASE = process.env.TW_BASE || "";
@@ -74,12 +144,13 @@ let WS_URL = process.env.TW_WS || "";
 let STATE_PATH = process.env.TW_STATE_PATH || "/api/game/state";
 let DEPLOY_PATH = process.env.TW_DEPLOY_PATH || "/api/strategy/deployment";
 let COOKIE = "";                        // session cookie jar for this process
-let AGENT_NAME = process.env.TW_NAME || ""; // learned from state if server-assigned
+let AGENT_NAME = NAME_HINT;             // learned from state if server-assigned
+let nameLearned = false;                // true once we've *seen* AGENT_NAME in a state
 let ROOM: number | null = FORCED_ROOM;
 const GAME_ID = 0; // unused in TW (room-based); kept so shared code compiles
 
 interface DeployPref { heroClass: HeroClass; skin?: string; label: string; }
-const SKIN_PREFS: DeployPref[] = DEF_SKIN ? [{ heroClass: DEF_CLASS, skin: DEF_SKIN, label: `${DEF_CLASS} ${DEF_SKIN}` }] : [];
+const SKIN_PREFS: DeployPref[] = SKIN_CANDIDATES.map((sk) => ({ heroClass: DEF_CLASS, skin: sk, label: `${DEF_CLASS} ${sk}` }));
 const FARCASTER: DeployPref = { heroClass: DEF_CLASS, label: `${DEF_CLASS}` };
 const BASE_PREF: DeployPref = { heroClass: DEF_CLASS, label: `base ${DEF_CLASS}` };
 // Throne Wars: everything is Silver-unlocked (no wallet). Try the chosen skin (if
@@ -87,7 +158,7 @@ const BASE_PREF: DeployPref = { heroClass: DEF_CLASS, label: `base ${DEF_CLASS}`
 const DEPLOY_PREFS: DeployPref[] = [...SKIN_PREFS, BASE_PREF];
 
 const CFG = {
-    itemPreference: [DEF_ITEM, "ring_of_regen", null] as (string | null)[],
+    itemPreference: [...LOADOUT.items] as (string | null)[],
     homeLane: DEF_LANE,
 
     // Cadence
@@ -254,22 +325,68 @@ function adaptAbility(p: any): Ability {
     return { id: p.id, level: p.level, cooldownRemaining: p.cooldownRemaining, cooldownTotal: p.cooldownTotal, activeRemaining: p.activeRemaining };
 }
 
+// FIX 5: the scoreboard used to be read at hard-coded array offsets (name=0,
+// level=4, abilities=13, abilityChoices=19...). Any field the dev inserts shifts
+// everything after it, and the first casualty is abilityChoices — which is
+// exactly "the bot stopped picking skills". We now LOCATE the structural fields
+// by shape on the first frame and log what we found.
+interface SbLayout { name: number; abilities: number; choices: number | null; detected: boolean; }
+let SB_LAYOUT: SbLayout | null = null;
+
+const looksLikeAbility = (v: any) =>
+    (Array.isArray(v) && typeof v[0] === "string" && typeof v[1] === "number") ||
+    (v && typeof v === "object" && typeof v.id === "string" && typeof v.level === "number");
+
+function detectScoreLayout(raw: any[]): SbLayout {
+    const l: SbLayout = { name: 0, abilities: 13, choices: 19, detected: false };
+    const nameIdx = raw.findIndex((v) => typeof v === "string");
+    const abilIdx = raw.findIndex((v) => Array.isArray(v) && v.length > 0 && v.every(looksLikeAbility));
+    // Ability choices: an array of plain strings (ability ids) that isn't the ability list.
+    const choiceIdx = raw.findIndex((v, i) => i !== abilIdx && Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === "string"));
+    if (nameIdx >= 0) l.name = nameIdx;
+    if (abilIdx >= 0) l.abilities = abilIdx;
+    l.choices = choiceIdx >= 0 ? choiceIdx : null;
+    l.detected = nameIdx >= 0;
+    console.log(`[schema] scoreboard layout: name=${l.name} abilities=${l.abilities} choices=${l.choices ?? "none-in-this-frame"}` +
+        `${l.name !== 0 || l.abilities !== 13 ? "  <-- DRIFTED from the old build's offsets" : ""}`);
+    return l;
+}
+
 function adaptScore(raw: any): ScoreEntry | null {
     if (Array.isArray(raw)) {
+        if (!SB_LAYOUT) SB_LAYOUT = detectScoreLayout(raw);
+        const L = SB_LAYOUT;
+        // Both of these arrays are EMPTY early in a round (no abilities learned, no
+        // offer pending), so a single detection pass on the first frame can lock in
+        // the wrong index. Re-locate them per entry, per frame; the cached layout is
+        // only a fallback.
+        const abilIdx = raw.findIndex((v: any) => Array.isArray(v) && v.length > 0 && v.every(looksLikeAbility));
+        const abilities = abilIdx >= 0 ? raw[abilIdx] : (Array.isArray(raw[L.abilities]) ? raw[L.abilities] : []);
+        if (abilIdx >= 0 && abilIdx !== L.abilities) {
+            console.log(`[schema] abilities live at index ${abilIdx} (old build assumed ${L.abilities}) — corrected`);
+            L.abilities = abilIdx;
+        }
+        const choiceIdx = raw.findIndex((v: any, i: number) =>
+            i !== abilIdx && Array.isArray(v) && v.length > 0 && v.every((x: any) => typeof x === "string"));
         return {
-            name: raw[0], faction: FACTIONS[raw[1]] ?? "human",
+            name: raw[L.name], faction: FACTIONS[raw[1]] ?? "human",
             heroClass: CLASSES[raw[2]] ?? "melee", lane: LANES[raw[3]] ?? "mid",
             level: raw[4], hp: raw[7], maxHp: raw[8],
             alive: raw[10] === 1 || raw[10] === true,
             respawnTimer: typeof raw[11] === "number" && raw[11] >= 0 ? raw[11] : undefined,
-            abilities: Array.isArray(raw[13]) ? raw[13].map(adaptAbility) : [],
+            abilities: abilities.map(adaptAbility),
             recallCooldownMs: typeof raw[16] === "number" && raw[16] > 0 ? raw[16] : 0,
-            abilityChoices: Array.isArray(raw[19]) ? raw[19] : undefined,
+            abilityChoices: choiceIdx >= 0 ? raw[choiceIdx] : undefined,
             skin: raw[23] ?? null,
         };
     }
     if (raw && typeof raw === "object" && "name" in raw) {
-        return { ...raw, abilities: (raw.abilities ?? []).map(adaptAbility) } as ScoreEntry;
+        return {
+            ...raw,
+            heroClass: raw.heroClass ?? raw.class,
+            abilities: (raw.abilities ?? []).map(adaptAbility),
+            abilityChoices: raw.abilityChoices ?? raw.choices ?? raw.pendingAbilities,
+        } as ScoreEntry;
     }
     return null;
 }
@@ -285,9 +402,14 @@ let lastWsSnapshotAt = 0;
 
 // Adapted world (rebuilt every WS frame)
 let W: { units: U[]; blds: Bld[]; sb: ScoreEntry[]; winner: Faction | null } | null = null;
+let lastRawSb: any[] = [];   // undecoded scoreboard, for schema-proof lookups
 
 let rest: RestState | null = null;
+let restAt = 0;              // FIX 8: when `rest` was last refreshed
 let restPolling = false;
+// A REST snapshot older than this is a lie, not a fallback. Without this the
+// bot re-confirmed itself off the boot-time snapshot for the whole session.
+const restFresh = () => !!rest && now() - restAt < Math.max(6_000, CFG.restPollMs * 4);
 let macroBusy = false;
 let pickBusy = false;
 
@@ -303,6 +425,27 @@ let lastDeployFailAt = 0;
 let joinedConfirmed = false;
 let itemIdx = 0;
 let prefIdx = 0;
+// prefIdx is reset to this every round (FIX 7). It only moves when we LEARN
+// something durable — e.g. that a skin id is silently ignored by the server.
+let prefFloor = 0;
+
+// Find our own row in the raw (undecoded) scoreboard. Works whether entries are
+// positional arrays or objects, and doesn't care which index anything lives at.
+function rawSelfEntry(): any | null {
+    if (!AGENT_NAME) return null;
+    return lastRawSb.find((e: any) =>
+        Array.isArray(e) ? e.includes(AGENT_NAME) : e?.name === AGENT_NAME) ?? null;
+}
+
+// Did the skin we asked for actually apply? Rather than trust a positional index
+// that may have drifted, just look for the id anywhere in our raw row.
+// null = can't tell (no row yet), true/false = definitive.
+function skinApplied(want: string): boolean | null {
+    const raw = rawSelfEntry();
+    if (!raw) return null;
+    const norm = (x: string) => x.toLowerCase().replace(/[^a-z0-9]/g, "");
+    return norm(JSON.stringify(raw)).includes(norm(want));
+}
 let skinGranted = true;
 let roundOverAt = 0;
 
@@ -452,11 +595,18 @@ function mySb(): ScoreEntry | undefined {
 }
 
 function meView(): MeView | null {
-    if (live()) {
-        const s = mySb();
+    if (live() && !sbScalarsSuspect) {
+        // The 20 Hz feed is fresh, so it IS the truth: if we're not in its
+        // scoreboard we are not in the game. Falling through to REST here let a
+        // few-seconds-old snapshot resurrect a hero the fast feed had already
+        // dropped, which showed up as a spurious confirm after every rollover.
+        return mySb() ?? null;
+    }
+    if (live() && sbScalarsSuspect && !rest) {
+        const s = mySb();      // nothing better available — lane/abilities still usable
         if (s) return s;
     }
-    const r = rest?.heroes?.find((h) => h.name === AGENT_NAME);
+    const r = restFresh() ? rest!.heroes?.find((h) => h.name === AGENT_NAME) : undefined;
     if (!r) return null;
     return {
         faction: r.faction, lane: r.lane, level: r.level, hp: r.hp, maxHp: r.maxHp,
@@ -468,7 +618,8 @@ function meView(): MeView | null {
 // Roster of heroes (name/faction/class/lane/level/alive) from best source.
 function roster(): { name: string; faction: Faction; heroClass: HeroClass; lane: Lane; level: number; alive: boolean }[] {
     if (live() && W!.sb.length) return W!.sb.map((h) => ({ name: h.name, faction: h.faction, heroClass: h.heroClass, lane: h.lane, level: h.level, alive: h.alive }));
-    return rest?.heroes?.map((h) => ({ name: h.name, faction: h.faction, heroClass: h.class, lane: h.lane, level: h.level, alive: h.alive })) ?? [];
+    if (!restFresh()) return [];
+    return rest!.heroes?.map((h) => ({ name: h.name, faction: h.faction, heroClass: h.class, lane: h.lane, level: h.level, alive: h.alive })) ?? [];
 }
 
 function laneStats(): LaneStat[] {
@@ -509,7 +660,7 @@ function laneStats(): LaneStat[] {
         });
     }
 
-    if (rest) {
+    if (restFresh()) {
         return LANES.map((lane) => {
             const l = rest!.lanes[lane];
             const friendly = l?.[myFaction!] ?? 0;
@@ -572,20 +723,8 @@ async function restPost(body: Record<string, any>, opts: { urgent?: boolean } = 
         // Room-based, cookie-authenticated with support for custom Authorization tokens
         const payload = ROOM !== null ? { room: ROOM, ...body } : body; //
 
-        // Assemble the headers context
-        const headers: Record<string, string> = {
-            "Content-Type": "application/json"
-        };
-
-        // Include fallback for vanilla session cookies
-        if (COOKIE) {
-            headers["Cookie"] = COOKIE;
-        }
-
-        // Inject explicit Authorization header extracted from browser
-        if (process.env.TW_AUTH) {
-            headers["Authorization"] = process.env.TW_AUTH;
-        }
+        // Auth token first, session cookie as the fallback (see authHeaders()).
+        const headers = authHeaders({ "Content-Type": "application/json" });
 
         const r = await fetch(`${REST_BASE}${DEPLOY_PATH}`, { //
             method: "POST",
@@ -596,7 +735,17 @@ async function restPost(body: Record<string, any>, opts: { urgent?: boolean } = 
         const text = await r.text(); //
         let warning: string | undefined; //
         if (r.status === 429) { restBackoffUntil = now() + 10_000; console.log("[rest] 429 — backing off 10s"); } //
-        else if (!r.ok) console.log(`[rest] deploy ${r.status}: ${text}`); //
+        else if (!r.ok) {
+            console.log(`[rest] deploy ${r.status}: ${text}`); //
+            // The server is telling us, in plain words, that it does not consider
+            // us deployed — our action payloads (heroLane / action / ability) all
+            // hit this same endpoint and are only valid for a live hero. Whatever
+            // we believed about our own state is wrong; drop it and re-join.
+            if (/first deployment requires heroClass/i.test(text) && joinedConfirmed) {
+                console.log("[round] server says we're not deployed — resetting and re-joining");
+                resetRoundState();
+            }
+        }
         else {
             try {
                 const j = JSON.parse(text); //
@@ -622,15 +771,19 @@ const actionRejected = (res: RestResult, action: string) =>
 async function slowRestFallback() {
     if (process.env.TW_ORACLE) return; // Parent Oracle handles REST completely
     if (restPolling) return;
-    if (live()) return; // GUARD: WS is alive
+    // FIX 8: was a hard `if (live()) return`, so once the socket came up REST
+    // was never polled again and `rest` froze at its boot value forever. Keep a
+    // slow trickle going so the fallback is actually a fallback.
+    if (live() && now() - restAt < 10_000) return;
 
     restPolling = true;
     try {
         const q = ROOM !== null ? `?room=${ROOM}` : "";
-        const r = await fetch(`${REST_BASE}${STATE_PATH}${q}`, { headers: COOKIE ? { Cookie: COOKIE } : {} });
+        const r = await fetch(`${REST_BASE}${STATE_PATH}${q}`, { headers: authHeaders() });
         captureCookie(r);
         if (!r.ok) { console.log(`[rest] state ${r.status}`); return; }
         rest = (await r.json()) as RestState;
+        restAt = now();
         processRestSideEffects();
     } catch (e) {
         console.log("[rest] poll error:", (e as Error).message);
@@ -639,27 +792,81 @@ async function slowRestFallback() {
     }
 }
 
+// FIX 6: round-over used to be detected ONLY here, from the REST state — but
+// slowRestFallback() bails out whenever the WebSocket is live, so in LIVE mode
+// (the normal mode!) `rest` stays null and a finished round was never noticed.
+// The bot went on believing it was deployed, kept firing {heroLane} at the
+// deploy endpoint for the next round, and the server answered:
+//   400 "First deployment requires heroClass"
+// Both feeds now funnel into the same handler.
+// FIX 8: the winner frame still contains last round's scoreboard, so for the
+// several seconds it lingers, meView() happily returns our dead level-11 hero
+// and lifecycleTick() re-confirms the join. That un-gates macro(), which starts
+// posting lane commands for a hero that no longer exists -> the 400. Nothing may
+// treat itself as deployed while this window is open.
+function betweenRounds(): boolean {
+    if (!roundOverAt) return false;
+    const elapsed = now() - roundOverAt;
+    // Don't sit out the full delay if the next round has visibly started and
+    // we're not in it — that's our cue to deploy, not to wait.
+    if (elapsed > 1_500 && live() && !W!.winner && !mySb()) { roundOverAt = 0; return false; }
+    if (elapsed < CFG.rejoinDelayMs) return true;
+    roundOverAt = 0;              // window elapsed; also self-heals if the feed dies
+    return false;
+}
+
+function noteRoundOver(winner: Faction, source: string) {
+    if (roundOverAt) return;      // the winner flag sits there for several seconds
+    roundOverAt = now();          // at 20 Hz — reset once, not 100 times
+    console.log(`[round] over — ${winner} won (via ${source}). Rejoining next round…`);
+    resetRoundState();
+}
+
 function processRestSideEffects() {
-    if (rest?.winner) {
-        if (!roundOverAt) {
-            roundOverAt = now();
-            console.log(`[round] over — ${rest.winner} won. Rejoining next round…`);
-        }
-        resetRoundState();
-        return;
-    }
-    if (roundOverAt && now() - roundOverAt < CFG.rejoinDelayMs) return;
-    roundOverAt = 0;
+    if (restFresh() && rest!.winner) { noteRoundOver(rest!.winner!, "REST"); return; }
+    if (betweenRounds()) return;
 }
 
 async function lifecycleTick() {
+    // Between rounds: the old scoreboard is still on the wire. Touch nothing.
+    if (betweenRounds()) return;
+
+    // FIX 2: before asking "where am I?", make sure we know WHO we are. The old
+    // build assumed AGENT_NAME was correct and never recovered when it wasn't.
+    if (!nameLearned) resolveIdentity();
+
     // Determine our hero from whichever data source is currently active (WS or REST)
     const me = meView();
 
     if (me) {
         if (!joinedConfirmed) {
             const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
-            console.log(`[join] confirmed: ${me.faction} ${me.heroClass} in ${me.lane} as ${AGENT_NAME}`);
+            console.log(`[join] confirmed: ${me.faction} ${me.heroClass} in ${me.lane} as ${AGENT_NAME} (room ${ROOM ?? "?"})`);
+            // FIX 7: say out loud what we asked for vs what we got. A skin that
+            // silently doesn't apply is otherwise invisible until you notice the
+            // wrong sprite on the spectator view.
+            const want = pref.skin ?? "(none)";
+            const got = me.skin === undefined ? "(not reported by this feed)" : me.skin ?? "(none)";
+            console.log(`[join] loadout: requested skin=${want} via "${SKIN_KEY}", item=${CFG.itemPreference[itemIdx] ?? "none"} | server reports skin=${got}`);
+            if (pref.skin) {
+                const took = skinApplied(pref.skin);
+                if (took === false && prefIdx < SKIN_PREFS.length - 1) {
+                    // The id was accepted with a 200 and then ignored — almost
+                    // certainly the wrong spelling. Try the next one next round.
+                    prefIdx++; prefFloor = prefIdx;
+                    console.log(`[join] skin "${pref.skin}" did not apply — trying "${DEPLOY_PREFS[prefIdx].skin}" next round`);
+                } else if (took === false) {
+                    // Out of spellings. Don't demote to the base sprite on this
+                    // evidence alone (the feed may simply not carry the field) —
+                    // just say so, loudly, once.
+                    console.log(`[join] WARNING none of the skin ids applied: ${SKIN_CANDIDATES.join(", ")}. ` +
+                        `The field name may be wrong — try SKIN_KEY = "heroSkin" or "skinId" in thronebot.ts.`);
+                } else if (took) {
+                    console.log(`[join] skin "${pref.skin}" applied`);
+                }
+            }
+            const rawSelf = W?.sb ? (W.sb as any[]).find((h) => h?.name === AGENT_NAME) : null;
+            if (rawSelf) console.log(`[join] self entry: ${JSON.stringify(rawSelf).slice(0, 300)}`);
         }
         joinedConfirmed = true;
         myFaction = me.faction;
@@ -671,24 +878,136 @@ async function lifecycleTick() {
         }
     } else {
         joinedConfirmed = false;
+        // FIX 3: don't just blindly re-POST a deploy (each retry carries heroLane,
+        // which the server broadcasts as a "moved to mid" call). First say out loud
+        // what we can see, then hunt for ourselves in other rooms, and only then
+        // consider an actual re-deploy.
+        reportUnconfirmed();
+        if (deploySentAt > 0) await scanRoomsForSelf();
         await maybeDeploy();
     }
 }
 
-// Roster of hero names present the moment BEFORE we deployed — anyone new after is us.
-let preDeployNames: Set<string> | null = null;
-function identifySelf(heroes: RestHero[]): string | null {
-    if (AGENT_NAME && heroes.some((h) => h.name === AGENT_NAME)) return AGENT_NAME;
-    if (!preDeployNames) return null; // haven't deployed yet
+// --- FIX 2 (cont.): identity resolution --------------------------------------
+// Three ladders, cheapest first:
+//   a) the name we were given in .env actually appears in the state -> done
+//   b) the deploy response told us our name (captured in adoptServerIdentity)
+//   c) diff the roster against the pre-deploy snapshot: whoever is new is us
+function resolveIdentity(): void {
+    const heroes = roster();
+    if (!heroes.length) return;
+
+    if (AGENT_NAME && heroes.some((h) => h.name === AGENT_NAME)) {
+        nameLearned = true;
+        console.log(`[id] identity confirmed: "${AGENT_NAME}"`);
+        return;
+    }
+    // Case-insensitive rescue: the server may normalise display names.
+    if (AGENT_NAME) {
+        const ci = heroes.find((h) => h.name.toLowerCase() === AGENT_NAME.toLowerCase());
+        if (ci) {
+            console.log(`[id] name case mismatch: env "${AGENT_NAME}" -> server "${ci.name}"`);
+            AGENT_NAME = ci.name; nameLearned = true;
+            return;
+        }
+    }
+    if (!preDeployNames) return;             // we haven't deployed yet — nothing to diff
+
     const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
     const fresh = heroes.filter((h) => !preDeployNames!.has(h.name));
-    // Prefer a fresh hero matching our class + chosen lane; else any fresh hero.
-    return (fresh.find((h) => h.class === pref.heroClass && h.lane === DEF_LANE)
-        ?? fresh.find((h) => h.class === pref.heroClass)
-        ?? fresh[0])?.name ?? null;
+    const guess = fresh.find((h) => h.heroClass === pref.heroClass && h.lane === CFG.homeLane)
+        ?? fresh.find((h) => h.heroClass === pref.heroClass)
+        ?? fresh[0];
+    if (guess) {
+        console.log(`[id] adopting server-assigned identity "${guess.name}" (${guess.heroClass} @ ${guess.lane})`);
+        if (NAME_HINT && guess.name !== NAME_HINT)
+            console.log(`[id] NOTE: this differs from TW_NAME="${NAME_HINT}" — the token's account is probably named "${guess.name}"`);
+        AGENT_NAME = guess.name; nameLearned = true;
+    }
 }
 
+// Anything the deploy response tells us about who/where we are, we take.
+function adoptServerIdentity(text: string): void {
+    let j: any; try { j = JSON.parse(text); } catch { return; }
+    if (!j || typeof j !== "object") return;
+    const nested = j.player ?? j.hero ?? j.agent ?? j.you ?? j.self ?? {};
+    const name = j.playerName ?? j.name ?? j.agentName ?? j.displayName ?? nested.name ?? nested.playerName;
+    if (typeof name === "string" && name && name !== AGENT_NAME) {
+        console.log(`[id] deploy response named us "${name}"`);
+        AGENT_NAME = name;
+    }
+    const room = j.room ?? j.roomId ?? j.roomNumber ?? j.gameId ?? nested.room;
+    const n = typeof room === "string" ? parseInt(room, 10) : room;
+    if (typeof n === "number" && Number.isFinite(n) && n !== ROOM) {
+        console.log(`[id] server placed us in room ${n} (we were watching ${ROOM ?? "none"}) — following`);
+        ROOM = n;
+        try { ws?.close(); } catch { }   // reconnect the feed to the right room
+    }
+    if (j.queued || j.waiting || /queue|waiting|partner/i.test(String(j.status ?? j.message ?? "")))
+        console.log(`[join] server says we're QUEUED, not spawned yet: ${JSON.stringify(j).slice(0, 200)}`);
+}
+
+// FIX 4: quick-join can drop us in ANY room; the old build polled room 1 forever.
+// If we've deployed but can't find ourselves, sweep the rooms and follow the one
+// our hero is actually in.
+let lastRoomScanAt = 0;
+async function scanRoomsForSelf(): Promise<void> {
+    if (!AGENT_NAME) return;                       // nothing to search for yet
+    if (now() - lastRoomScanAt < 15_000) return;
+    lastRoomScanAt = now();
+    // Rooms are NOT small numbers — live traffic has us in room 49. Sweeping
+    // 1..8 would never find us, so search the neighbourhood of the room we think
+    // we're in first, then the low-numbered ones.
+    const span = parseInt(process.env.TW_ROOM_SCAN ?? "8", 10) || 8;
+    const near = ROOM ? Array.from({ length: 9 }, (_, i) => ROOM! - 4 + i).filter((r) => r > 0) : [];
+    const low = Array.from({ length: span }, (_, i) => i + 1);
+    const candidates = [...new Set([...near, ...low])];
+    for (const r of candidates) {
+        if (r === ROOM) continue;
+        try {
+            const res = await fetch(`${REST_BASE}${STATE_PATH}?room=${r}`, { headers: authHeaders() });
+            if (!res.ok) continue;
+            const j: any = await res.json().catch(() => null);
+            const heroes: any[] = j?.heroes ?? j?.heroScoreboard ?? [];
+            if (Array.isArray(heroes) && heroes.some((h: any) => h?.name === AGENT_NAME)) {
+                console.log(`[room] found "${AGENT_NAME}" in room ${r} — switching from room ${ROOM ?? "none"}`);
+                ROOM = r;
+                try { ws?.close(); } catch { }
+                return;
+            }
+        } catch { /* next room */ }
+    }
+}
+
+// Loud, throttled explanation of why we think we're not in the game. This is the
+// single most useful log line when the server's shape changes again.
+let lastUnconfirmedLogAt = 0;
+function reportUnconfirmed(): void {
+    if (now() - lastUnconfirmedLogAt < 10_000) return;
+    lastUnconfirmedLogAt = now();
+    const names = roster().map((h) => h.name);
+    console.log(
+        `[diag] not confirmed in game | looking for "${AGENT_NAME || "(no name yet)"}" | room=${ROOM ?? "?"} | ` +
+        `source=${live() ? "WS" : rest ? "REST" : "NONE"} | roster(${names.length}): ${names.join(", ") || "(empty)"}`
+    );
+    if (!AUTH_HEADER) console.log(`[diag] WARNING: no auth token resolved — set TW_AUTH (or TW_AUTH_${CHILD_ID}) in .env`);
+}
+
+// Roster of hero names present the moment BEFORE we deployed — anyone new after is us.
+let preDeployNames: Set<string> | null = null;
+// (identifySelf lived here — it was never called. Replaced by resolveIdentity().)
+
+// The field name the server accepts for an ability pick. We start with the one
+// the old build used and fall through the alternatives on rejection, then stick
+// with whatever worked. Silent failure here was the second half of "it never
+// picks skills" — a 400 used to produce no output at all.
+const PICK_KEYS = ["abilityChoice", "ability", "abilityId", "chooseAbility", "levelUpAbility"];
+let pickKeyIdx = 0;
+let pickKeyLocked: string | null = null;
+let pickRetryAfter = 0;
+
 async function pickIfPending(heroClass: HeroClass, abilities: Ability[], choices?: string[]) {
+    if (!joinedConfirmed) return;            // FIX 6
     if (!choices?.length) { lastPickId = ""; return; }
     if (pickBusy) return;
     const pick = nextAbilityPick(heroClass, abilities, choices);
@@ -696,46 +1015,103 @@ async function pickIfPending(heroClass: HeroClass, abilities: Ability[], choices
     if (pick === lastPickId && now() - lastPickPostAt < 5000) return;
     pickBusy = true;
     try {
-        const res = await restPost({ abilityChoice: pick }, { urgent: true });
-        if (res.ok) {
+        // One key per invocation — restPost self-throttles, so a tight retry loop
+        // here would just collect "throttled" and never reach the next candidate.
+        if (pickKeyLocked === null && now() < pickRetryAfter) return;
+        const key = pickKeyLocked ?? PICK_KEYS[pickKeyIdx % PICK_KEYS.length];
+        const res = await restPost({ [key]: pick }, { urgent: true });
+        if (res.status === 0) return;                     // throttled — next tick
+        if (res.ok && !/unknown|invalid|ignored/i.test(res.warning ?? "")) {
+            if (pickKeyLocked === null) {
+                pickKeyLocked = key;
+                if (key !== PICK_KEYS[0]) console.log(`[act] ability-pick field is "${key}" (not "${PICK_KEYS[0]}") — locking it in`);
+            }
             lastPickId = pick; lastPickPostAt = now();
-            console.log(`[act] ability -> ${pick}   (choices were: ${choices.join(", ")})`);
+            console.log(`[act] ability -> ${pick}   (offered: ${choices.join(", ")})`);
+            return;
+        }
+        console.log(`[act] ability pick "${pick}" rejected via "${key}" (${res.status}): ${res.text.slice(0, 160)}`);
+        if (pickKeyLocked === null) {
+            pickKeyIdx++;
+            if (pickKeyIdx >= PICK_KEYS.length) {         // exhausted — cool off, then cycle again
+                pickKeyIdx = 0;
+                pickRetryAfter = now() + 15_000;
+                console.log(`[act] no ability-pick field accepted (tried: ${PICK_KEYS.join(", ")}) — retrying in 15s. Paste this line if it persists.`);
+            }
         }
     } finally {
         pickBusy = false;
     }
 }
 
+let acceptedDeploys = 0;
 async function maybeDeploy() {
     if (deployInFlight) return;
     if (now() - lastDeployFailAt < 4000) return;
+    // Don't deploy into a round that's already decided — wait for the next one.
+    if (betweenRounds()) return;
     const retryDue = deploySentAt > 0 && now() - deploySentAt > CFG.joinConfirmGraceMs;
     if (deploySentAt > 0 && !retryDue) return;
+    // FIX 3 (cont.): if the server keeps ACCEPTING our deploys but we still can't
+    // find ourselves, more deploys won't help — we're either queued for a partner
+    // or looking in the wrong room. Stop hammering and say so.
+    if (acceptedDeploys >= 3) {
+        if (retryDue) {
+            deploySentAt = now();
+            console.log(`[join] ${acceptedDeploys} deploys accepted but never confirmed — holding off. ` +
+                `Either ranked is holding us in the pairing queue, or our hero is in a room we're not watching ` +
+                `(room=${ROOM ?? "?"}). Watch: https://thronewars.gg/?room=${ROOM ?? 1}${AGENT_NAME ? `&follow=${AGENT_NAME}` : ""}`);
+        }
+        return;
+    }
     deployInFlight = true;
     try {
         const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
         const item = CFG.itemPreference[itemIdx] ?? null;
         // Snapshot who's already in the room so we can recognise our new hero after.
-        if (rest?.heroes) preDeployNames = new Set(rest.heroes.map((h) => h.name));
+        // (Was REST-only; in LIVE mode rest is null and the diff never had a baseline.)
+        const before = roster().map((h) => h.name);
+        if (before.length || rest?.heroes) preDeployNames = new Set(before);
         const body: Record<string, any> = { heroClass: pref.heroClass, heroLane: CFG.homeLane, message: "bot online" };
+        // FIX 3: a *retry* must not re-send heroLane — that's what was firing a
+        // "moved to mid" broadcast every 25s while we sat there unidentified.
+        if (retryDue) delete body.heroLane;
         // Identity comes from the auth token (TW_NAME is only our local lookup key),
         // so we do NOT send a name in the deploy body — a mismatch could confuse the server.
-        if (pref.skin) body.skin = pref.skin;
+        if (pref.skin) body[SKIN_KEY] = pref.skin;
         if (item) body.equippedItem = item;
         console.log(`[join] deploying ${pref.label} @ ${CFG.homeLane}${item ? ` +${item}` : ""}${retryDue ? " (retry)" : ""}`);
         const res = await restPost(body, { urgent: true });
         if (res.ok) {
+            console.log(`[join] deploy accepted: ${res.text.slice(0, 300) || "(empty body)"}`);
+            adoptServerIdentity(res.text);   // name / room / queue status, if offered
+            acceptedDeploys++;
             deploySentAt = now();
             lastLaneCmdAt = now();
             currentLaneTarget = CFG.homeLane;
             deployFails = 0;
             if (res.warning && /skin/i.test(res.warning)) skinGranted = false;
+        } else if (res.status === 0) {
+            lastDeployFailAt = now();          // transport error — back off, don't hammer
         } else if (res.status >= 400 && res.status < 500) {
             lastDeployFailAt = now();
-            deployFails++;
-            if (/skin|class|wallet/i.test(res.text) && prefIdx < DEPLOY_PREFS.length - 1) {
+            // The rollover 400 isn't a loadout problem — it's handled by the
+            // round-reset path in restPost(). Don't let it count toward the
+            // "3 strikes and drop the skin" escalation below.
+            if (!/first deployment requires heroClass/i.test(res.text)) deployFails++;
+            // FIX 7: this used to be /skin|class|wallet/i, which matches the word
+            // "heroClass" — and the round-rollover 400 reads:
+            //   First deployment requires heroClass: "melee", "ranged", or "mage".
+            // So every rollover demoted us one rung down DEPLOY_PREFS, silently
+            // dropping the skin and deploying as a base mage for the rest of the
+            // process's life. Demote ONLY on a message that's actually about the
+            // loadout being unavailable to us.
+            const skinRejected = /skin/i.test(res.text)
+                && !/first deployment requires heroClass/i.test(res.text)
+                && /(unknown|invalid|locked|no such|purchase|must buy|not\s+(owned|unlocked|available)|(do(es)?\s+not|don'?t)\s+own)/i.test(res.text);
+            if (skinRejected && prefIdx < DEPLOY_PREFS.length - 1) {
                 prefIdx++; deployFails = 0;
-                console.log(`[join] skin/class rejected, falling back to ${DEPLOY_PREFS[prefIdx].label}`);
+                console.log(`[join] skin rejected (${res.text.slice(0, 120)}), falling back to ${DEPLOY_PREFS[prefIdx].label}`);
             } else if (/item|equip/i.test(res.text) && itemIdx < CFG.itemPreference.length - 1) {
                 itemIdx++; deployFails = 0;
                 console.log(`[join] item rejected, falling back to ${CFG.itemPreference[itemIdx] ?? "no item"}`);
@@ -762,6 +1138,13 @@ async function maybeDeploy() {
 
 function resetRoundState() {
     joinedConfirmed = false;
+    // FIX 7: fall-backs are per-round, not permanent. If the skin or item was
+    // unavailable last round (or we demoted by mistake), ask for the good
+    // loadout again — ownership can also change mid-session once you buy it.
+    prefIdx = prefFloor;
+    itemIdx = 0;
+    skinGranted = true;
+    acceptedDeploys = 0;
     deploySentAt = 0;
     deployFails = 0;
     lastDeployFailAt = 0;
@@ -790,7 +1173,7 @@ function wsConnect() {
     const q = ROOM !== null ? `?room=${ROOM}` : "";
     let gotSnapshotThisConn = false;
     frameDecodeFailLogged = false;
-    ws = new WebSocket(`${host}/${q}`, COOKIE ? { headers: { Cookie: COOKIE } } : undefined);
+    ws = new WebSocket(`${host}/${q}`, { headers: authHeaders() });
 
     const watchdog = setTimeout(() => {
         if (!gotSnapshotThisConn && !process.env.TW_ORACLE) {
@@ -844,6 +1227,8 @@ function wsConnect() {
 }
 
 let schemaDumped = false;
+let sbScalarsChecked = false;
+let sbScalarsSuspect = false;
 function onWsSnapshot(s: any, rawText: string) {
     if (process.env.TW_ORACLE) return; // Handled by IPC
 
@@ -851,23 +1236,45 @@ function onWsSnapshot(s: any, rawText: string) {
     const blds = ((s.buildings ?? []) as any[]).map(adaptBuilding).filter((b): b is Bld => !!b);
     const sb = ((s.heroScoreboard ?? []) as any[]).map(adaptScore).filter((e): e is ScoreEntry => !!e);
     W = { units, blds, sb, winner: s.winner ?? null };
+    lastRawSb = Array.isArray(s.heroScoreboard) ? s.heroScoreboard : [];
     lastWsSnapshotAt = now();
 
     if (!schemaDumped) {
         schemaDumped = true;
         console.log(`[schema] fast feed on — adapted ${units.length} units, ${blds.length} buildings, ${sb.length} scoreboard entries (positional mode ${units.some((u) => u.isHero) ? "ON" : "limited"})`);
+        console.log(`[schema] top-level keys: ${Object.keys(s).join(", ")}`);
+        if (Array.isArray(s.heroScoreboard) && s.heroScoreboard[0])
+            console.log(`[schema] raw scoreboard[0]: ${JSON.stringify(s.heroScoreboard[0]).slice(0, 400)}`);
         if (!frameSampleWritten) {
             frameSampleWritten = true;
-            try { fs.writeFileSync("frame-sample.json", rawText); } catch { }
+            try { fs.writeFileSync("frame-sample.json", rawText); console.log("[schema] wrote frame-sample.json (paste this if anything still looks wrong)"); } catch { }
         }
+    }
+
+    // Sanity-check the positionally-decoded scalars. If they're nonsense the
+    // layout drifted further than we can infer, so stop trusting the fast feed
+    // for our own stats and let REST drive instead of acting on garbage HP.
+    if (!sbScalarsChecked && sb.length) {
+        const bad = sb.find((h) => !(h.maxHp > 0) || h.hp > h.maxHp * 1.5 || !(h.level >= 1 && h.level <= 40));
+        if (bad) {
+            sbScalarsSuspect = true;
+            console.log(`[schema] WARNING scoreboard scalars look wrong (${bad.name}: lvl=${bad.level} hp=${bad.hp}/${bad.maxHp}) — falling back to REST for self stats`);
+        }
+        sbScalarsChecked = true;
     }
 
     processWsSideEffects();
 }
 
+let missingSinceAt = 0;
 function processWsSideEffects() {
+    // Round over, seen on the fast feed (see FIX 6).
+    if (W?.winner) { noteRoundOver(W.winner, "WS"); return; }
+    if (betweenRounds()) return;
+
     const me = mySb();
     if (me) {
+        missingSinceAt = 0;
         myFaction = me.faction;
         if (now() - lastLaneCmdAt > 3500) serverLane = me.lane;
         if (typeof me.recallCooldownMs === "number" && me.recallCooldownMs > 0)
@@ -875,6 +1282,18 @@ function processWsSideEffects() {
         if (me.alive) recordHp(me.hp, me.maxHp);
         // Instant ability picks from the 20 Hz feed.
         if (me.abilityChoices?.length) void pickIfPending(me.heroClass, me.abilities, me.abilityChoices);
+    } else if (joinedConfirmed && W) {
+        // Belt and braces: a round can also roll over without us ever catching a
+        // `winner` frame (we might be mid-reconnect). If we were confirmed and our
+        // hero is simply gone from the scoreboard for 3s, we're out — stop acting
+        // as though we're deployed and go through a clean re-join.
+        if (!missingSinceAt) missingSinceAt = now();
+        else if (now() - missingSinceAt > 3000) {
+            console.log(`[round] our hero left the scoreboard — treating as a new round, re-deploying`);
+            missingSinceAt = 0;
+            resetRoundState();
+        }
+        return;
     }
     reflex();
 }
@@ -882,6 +1301,7 @@ function processWsSideEffects() {
 // ----------------------------- Actions -----------------------------------------
 
 async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
+    if (!joinedConfirmed) return false;      // FIX 6: no hero, no actions
     if (!ready(kind) || channelingRecall()) return false;
     const prev = cd[kind];
     cd[kind] = now() + (kind === "sprint" ? CFG.sprintCdMs : CFG.strollCdMs);
@@ -898,6 +1318,7 @@ async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
 }
 
 async function sendRecall(reason: string): Promise<boolean> {
+    if (!joinedConfirmed) return false;      // FIX 6
     if (!ready("recall")) return false;
     const prev = cd.recall;
     cd.recall = now() + CFG.recallCdMs;
@@ -914,6 +1335,7 @@ async function sendRecall(reason: string): Promise<boolean> {
 }
 
 async function commandLane(lane: Lane, reason: string, opts: { sprint?: boolean; emergency?: boolean; allowRepeat?: boolean } = {}) {
+    if (!joinedConfirmed) return;            // FIX 6: this is what produced the 400s
     const committed = now() - lastLaneCmdAt < 3500 ? currentLaneTarget : (serverLane ?? currentLaneTarget);
     if (lane === committed && !opts.allowRepeat) {
         if (opts.sprint) void sendMovement("sprint");
@@ -944,20 +1366,30 @@ async function commandLane(lane: Lane, reason: string, opts: { sprint?: boolean;
 // ----------------------------- Ability builds ----------------------------------
 
 const ALIAS: Record<string, string[]> = {
-    fortitude: ["fortitude", "defensive_aura", "ring_of_healing", "soul_harvest"],
-    fury: ["fury", "earthquake"],
+    fortitude: ["fortitude", "defensive_aura", "ring_of_healing", "soul_harvest", "bramble_patch"],
+    // Skin variants that REPLACE Fury. Throne of Bones turns it into the Skeleton
+    // Archer summon; we don't know the exact server id, so accept the plausible
+    // spellings — whichever one is actually offered will match.
+    fury: ["fury", "earthquake", "skeleton_archer", "raise_skeleton_archer", "skeletal_archer", "bone_archer", "skeleton_archers"],
 };
 const idsFor = (id: string) => ALIAS[id] ?? [id];
 
+// Skin ids aren't documented, so match loosely rather than by exact string.
+const skinIs = (skin: string | null, re: RegExp) => !!skin && re.test(skin);
+
 function currentSkin(me: MeView | null): string | null {
-    if (me && me.skin !== undefined) return me.skin ?? null;
+    // Trust a real value from the server. But a MISSING one means "this feed
+    // doesn't carry the field" (REST heroes have no skin key at all, and the WS
+    // index for it may have drifted) — not "we have no skin". Treating that as
+    // null quietly swapped us onto the base-class ability build.
+    if (me?.skin) return me.skin;
     const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
     return skinGranted ? pref.skin ?? null : null;
 }
 
 function buildWants(heroClass: HeroClass, skin: string | null): [string, number][] {
     if (heroClass === "melee") {
-        if (skin === "treant") {
+        if (skinIs(skin, /treant/i)) {
             return [["fury", 4], ["divine_shield", 1], ["cleave", 1], ["fortitude", 4], ["thorns", 4]];
         }
         const physical = enemyPhysicalShare() >= 0.5;
@@ -967,8 +1399,28 @@ function buildWants(heroClass: HeroClass, skin: string | null): [string, number]
         return physical ? [...base, ["thorns", 4], ["fury", 4]] : [...base, ["fury", 4], ["thorns", 2]];
     }
     if (heroClass === "mage") {
+        // Throne of Bones: Fury becomes Skeleton Archer — a summon that outclasses
+        // the vanilla Raise Skeleton (up to 3 alive, they follow you, they tank in
+        // front at 130px range). So it gets picked BEFORE Raise Skeleton. Both stay
+        // at rank 1 through the core: one archer set plus one skeleton is all the
+        // body-blocking we need, and the damage lives in Fireball/Tornado.
+        if (skinIs(skin, /bones|throne_of_bones|necro/i)) {
+            return [
+                ["fireball", 1],
+                ["tornado", 1],
+                ["fury", 1],             // -> Skeleton Archer, ahead of raise_skeleton
+                ["raise_skeleton", 1],
+                ["fireball", 4],
+                ["tornado", 4],
+                ["fortitude", 4],
+                // Nothing capped here on purpose: once the core is maxed the generic
+                // fallback pours the remaining picks into whatever is still under 4,
+                // which is exactly the two summons. They scale late without ever
+                // stealing an early pick from Fireball or Tornado.
+            ];
+        }
         // Rule (field-coached): Skeleton 1 is ALWAYS picked before Fortitude/Heal 1.
-        if (skin === "pixagreen_mage") {
+        if (skinIs(skin, /pixagreen|emerald/i)) {
             // FB1 -> Nado1 -> Skel1 -> Heal1 -> max FB -> max Nado -> max Heal -> Skel
             return [
                 ["fireball", 1],
@@ -1454,7 +1906,7 @@ async function discover(): Promise<boolean> {
         for (const path of STATE_PATHS) {
             for (const q of ROOM !== null ? [`?room=${ROOM}`] : ["", "?room=1"]) {
                 try {
-                    const r = await fetch(`${base}${path}${q}`, { headers: COOKIE ? { Cookie: COOKIE } : {} });
+                    const r = await fetch(`${base}${path}${q}`, { headers: authHeaders() });
                     captureCookie(r);
                     if (!r.ok) continue;
                     const j: any = await r.json().catch(() => null);
@@ -1466,7 +1918,7 @@ async function discover(): Promise<boolean> {
                         for (const dp of DEPLOY_PATHS) {
                             try {
                                 const pr = await fetch(`${REST_BASE}${dp}`, {
-                                    method: "POST", headers: { "Content-Type": "application/json", ...(COOKIE ? { Cookie: COOKIE } : {}) },
+                                    method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
                                     body: JSON.stringify({ ping: true }),
                                 });
                                 captureCookie(pr);
@@ -1541,7 +1993,7 @@ async function runOracleParent() {
     setInterval(async () => {
         try {
             const q = ROOM !== null ? `?room=${ROOM}` : "";
-            const r = await fetch(`${REST_BASE}${STATE_PATH}${q}`);
+            const r = await fetch(`${REST_BASE}${STATE_PATH}${q}`, { headers: authHeaders() });
             if (!r.ok) return;
             const restData = await r.json();
             children.forEach(c => c.send({ type: "rest", payload: restData }));
@@ -1553,7 +2005,7 @@ async function runOracleParent() {
     function connectOracleWs() {
         const host = WS_URL;
         const q = ROOM !== null ? `?room=${ROOM}` : "";
-        oracleWsConn = new WebSocket(`${host}/${q}`);
+        oracleWsConn = new WebSocket(`${host}/${q}`, { headers: authHeaders() });
 
         oracleWsConn.on("open", () => {
             console.log(`[oracle] WS connected: ${host}${q} (State Oracle active)`);
@@ -1590,7 +2042,9 @@ async function runOracleParent() {
 }
 
 async function runBot() {
-    console.log(`[boot] thronebot #${CHILD_ID}${AGENT_NAME ? ` "${AGENT_NAME}"` : ""} | room ${ROOM ?? "(discover)"} | ${DEF_CLASS}${DEF_SKIN ? "/" + DEF_SKIN : ""} @ ${DEF_LANE} | item ${DEF_ITEM} | token ${process.env.TW_AUTH ? "set" : "MISSING"}${DEBUG ? " | DEBUG" : ""}`);
+    console.log(`[boot] thronebot #${CHILD_ID}${AGENT_NAME ? ` "${AGENT_NAME}"` : ""} | room ${ROOM ?? "(discover)"} | ${DEF_CLASS}${DEF_SKIN ? "/" + DEF_SKIN : ""} @ ${DEF_LANE} | item ${DEF_ITEM} | token ${AUTH_HEADER ? `set (…${AUTH_TOKEN.slice(-6)})` : "MISSING"}${DEBUG ? " | DEBUG" : ""}`);
+    if (!AUTH_HEADER) console.log("[boot] no TW_AUTH/TW_AUTH_1 found — the server will treat us as an anonymous guest and name us itself.");
+    if (!NAME_HINT) console.log("[boot] no TW_NAME set — we'll learn our name from the game state after deploying.");
 
     const ok = await discover();
     if (!ok) {
@@ -1615,6 +2069,7 @@ async function runBot() {
                 processWsSideEffects();
             } else if (msg.type === "rest") {
                 rest = msg.payload;
+                restAt = now();
                 processRestSideEffects();
             }
         });

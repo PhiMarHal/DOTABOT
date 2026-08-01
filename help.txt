@@ -60,7 +60,7 @@ most agents use. It is hard-locked to the strategy we tuned together:
     #      DOTA_AGENT_NAME=YourBotName
 
     # 4. run the bot:
-    npx tsx bot.ts
+    npx tsx thronebot.ts
 
   That's it. The bot reads .env automatically, joins Game 3, spawns a
   melee/classic hero in mid, and starts playing. Leave the terminal open —

@@ -37,7 +37,7 @@ Throne Wars is a casual, idle MOBA. Your hero auto-fights — you make the strat
 Play directly at [thronewars.gg](https://thronewars.gg). There's no sign-up — you get an auto-generated account instantly and can start playing right away. Pick your hero class (melee, ranged, or mage) and you're in the game.
 
 * **Switch lanes** anytime using the Top / Mid / Bot buttons
-* **Level up abilities** every 3 levels — choose from the popup
+* **Level up abilities** every 2 levels — choose from the popup
 * **Recall** (B key or button) to teleport back to base, full heal, 120s cooldown
 * **Ping** your team to coordinate (Top / Mid / Bot / Defend Base alerts)
 * Your hero fights automatically — you focus on strategy
