@@ -128,6 +128,8 @@ const LOADOUT = {
 //   melee -> Vanguard (Defensive Aura), ranged -> Centaur (Bramble Patch)
 
 const FORCED_ROOM = process.env.TW_ROOM ? parseInt(process.env.TW_ROOM, 10) : null;
+// In party mode the parent tells us which room its shared feed is watching.
+const PARTY_ROOM = process.env.TW_PARTY_ROOM ? parseInt(process.env.TW_PARTY_ROOM, 10) : FORCED_ROOM;
 const DEF_CLASS = LOADOUT.heroClass;
 const SKIN_CANDIDATES: string[] = LOADOUT.skin ?? [];
 const DEF_SKIN: string | undefined = SKIN_CANDIDATES[0];
@@ -226,6 +228,7 @@ const CFG = {
     recallCdMs: 120_000,
     sprintCdMs: 25_000,
     strollCdMs: 25_000,
+    spawnStrollWindowMs: 12_000,   // how long after entering we'll still bother
     recallChannelMs: 2_600,
 };
 
@@ -424,6 +427,17 @@ let deployFails = 0;
 let lastDeployFailAt = 0;
 let joinedConfirmed = false;
 let itemIdx = 0;
+// Party mode: children normally consume the parent's single WS/REST feed over
+// IPC instead of opening their own. That only works while every bot is in the
+// SAME room — if quick-join scatters us, a child has to go self-sufficient.
+let ORACLE = !!process.env.TW_ORACLE;
+function defectFromOracle(reason: string) {
+    if (!ORACLE) return;
+    ORACLE = false;
+    console.log(`[party] leaving the shared feed: ${reason}. Opening our own socket.`);
+    wsConnect();
+}
+
 let prefIdx = 0;
 // prefIdx is reset to this every round (FIX 7). It only moves when we LEARN
 // something durable — e.g. that a skin id is silently ignored by the server.
@@ -769,7 +783,7 @@ const actionRejected = (res: RestResult, action: string) =>
     !res.ok || (!!res.warning && new RegExp(action, "i").test(res.warning));
 
 async function slowRestFallback() {
-    if (process.env.TW_ORACLE) return; // Parent Oracle handles REST completely
+    if (ORACLE) return; // Parent Oracle handles REST completely
     if (restPolling) return;
     // FIX 8: was a hard `if (live()) return`, so once the socket came up REST
     // was never polled again and `rest` froze at its boot value forever. Keep a
@@ -842,6 +856,8 @@ async function lifecycleTick() {
         if (!joinedConfirmed) {
             const pref = DEPLOY_PREFS[Math.min(prefIdx, DEPLOY_PREFS.length - 1)];
             console.log(`[join] confirmed: ${me.faction} ${me.heroClass} in ${me.lane} as ${AGENT_NAME} (room ${ROOM ?? "?"})`);
+            spawnedAt = now();
+            pacedThisSpawn = false;      // arm the one opening Stroll
             // FIX 7: say out loud what we asked for vs what we got. A skin that
             // silently doesn't apply is otherwise invisible until you notice the
             // wrong sprite on the spectator view.
@@ -938,6 +954,8 @@ function adoptServerIdentity(text: string): void {
     }
     const room = j.room ?? j.roomId ?? j.roomNumber ?? j.gameId ?? nested.room;
     const n = typeof room === "string" ? parseInt(room, 10) : room;
+    if (typeof n === "number" && Number.isFinite(n) && ORACLE && n !== PARTY_ROOM)
+        defectFromOracle(`quick-join put us in room ${n}, the party is in ${PARTY_ROOM ?? "another room"}`);
     if (typeof n === "number" && Number.isFinite(n) && n !== ROOM) {
         console.log(`[id] server placed us in room ${n} (we were watching ${ROOM ?? "none"}) — following`);
         ROOM = n;
@@ -1073,6 +1091,10 @@ async function maybeDeploy() {
         const before = roster().map((h) => h.name);
         if (before.length || rest?.heroes) preDeployNames = new Set(before);
         const body: Record<string, any> = { heroClass: pref.heroClass, heroLane: CFG.homeLane, message: "bot online" };
+        // Ask for a specific room when we know which one we want (party mode, or
+        // TW_ROOM). Harmless if the server ignores it — it echoes back the room
+        // it actually gave us, and adoptServerIdentity() follows that.
+        if (ROOM !== null) body.room = ROOM;
         // FIX 3: a *retry* must not re-send heroLane — that's what was firing a
         // "moved to mid" broadcast every 25s while we sat there unidentified.
         if (retryDue) delete body.heroLane;
@@ -1176,7 +1198,7 @@ function wsConnect() {
     ws = new WebSocket(`${host}/${q}`, { headers: authHeaders() });
 
     const watchdog = setTimeout(() => {
-        if (!gotSnapshotThisConn && !process.env.TW_ORACLE) {
+        if (!gotSnapshotThisConn && !ORACLE) {
             console.log(`[ws] no decodable snapshots from ${host} — retrying (REST keeps playing)`);
             try { ws?.close(); } catch { }
         }
@@ -1185,18 +1207,18 @@ function wsConnect() {
     ws.on("open", () => {
         console.log(`[ws] connected: ${host}${q} (Child #${CHILD_ID})`);
 
-        if (process.env.TW_ORACLE) clearTimeout(watchdog);
+        if (ORACLE) clearTimeout(watchdog);
 
         // TW is cookie-authenticated; send a room subscribe in case the server wants one.
         // ORACLE FIX: Skip subscribing on children to radically slash game server bandwidth
-        if (!process.env.TW_ORACLE) {
+        if (!ORACLE) {
             try { ws!.send(JSON.stringify({ type: "subscribe", room: ROOM })); } catch { }
         }
     });
 
     ws.on("message", (data: WebSocket.RawData) => {
         // ORACLE FIX: Let the centralized parent parse the feed. Save 19x zlib/JSON.parse cycles.
-        if (process.env.TW_ORACLE) return;
+        if (ORACLE) return;
 
         wsFrames++;
         const buf = Array.isArray(data) ? Buffer.concat(data as Buffer[])
@@ -1230,7 +1252,7 @@ let schemaDumped = false;
 let sbScalarsChecked = false;
 let sbScalarsSuspect = false;
 function onWsSnapshot(s: any, rawText: string) {
-    if (process.env.TW_ORACLE) return; // Handled by IPC
+    if (ORACLE) return; // Handled by IPC
 
     const units = (s.units as any[]).map(adaptUnit).filter((u): u is U => !!u);
     const blds = ((s.buildings ?? []) as any[]).map(adaptBuilding).filter((b): b is Bld => !!b);
@@ -1267,6 +1289,7 @@ function onWsSnapshot(s: any, rawText: string) {
 }
 
 let missingSinceAt = 0;
+let spawnedAt = 0;      // when our hero last entered the world
 function processWsSideEffects() {
     // Round over, seen on the fast feed (see FIX 6).
     if (W?.winner) { noteRoundOver(W.winner, "WS"); return; }
@@ -1300,7 +1323,7 @@ function processWsSideEffects() {
 
 // ----------------------------- Actions -----------------------------------------
 
-async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
+async function sendMovement(kind: "sprint" | "stroll", reason = ""): Promise<boolean> {
     if (!joinedConfirmed) return false;      // FIX 6: no hero, no actions
     if (!ready(kind) || channelingRecall()) return false;
     const prev = cd[kind];
@@ -1313,7 +1336,7 @@ async function sendMovement(kind: "sprint" | "stroll"): Promise<boolean> {
         else if (!/remaining/.test(res.warning)) cd[kind] = now() + 2500;
         return false;
     }
-    console.log(`[act] ${kind}`);
+    console.log(`[act] ${kind}${reason ? `  (${reason})` : ""}`);
     return true;
 }
 
@@ -1887,15 +1910,38 @@ async function macro() {
     if (best && best.score > hereEval.score + CFG.switchMargin) {
         const sprint = best.urgency > 0.5 || best.score - hereEval.score > 3;
         await commandLane(best.l.lane, `${describe(best)} [${best.score.toFixed(1)} vs ${hereEval.score.toFixed(1)}]`, { sprint });
+        return;
     }
+
+    // 8) OPENING STROLL — lowest-priority action, so it never costs us a rotation.
+    await maybeSpawnStroll();
 }
+
+// One Stroll on entering the game, and that's it.
+//
+// We spawn and walk straight out ahead of the creeps, which leaves us as the
+// only thing an early enemy hero can hit. Half speed for 5s lets the wave form
+// up in front of us. Deliberately fire-once: the cooldown is 25s and it's worth
+// far more held in reserve for a real moment than spent pacing.
+let pacedThisSpawn = true;
+async function maybeSpawnStroll(): Promise<boolean> {
+    if (pacedThisSpawn) return false;
+    // Give up rather than stroll at some random later point.
+    if (!spawnedAt || now() - spawnedAt > CFG.spawnStrollWindowMs) { pacedThisSpawn = true; return false; }
+    if (!ready("stroll") || channelingRecall()) return false;
+    if (now() - lastLaneCmdAt < 2_000) return false;   // a peel's aggro immunity is for moving
+    const sent = await sendMovement("stroll", "opening — letting the wave form up");
+    if (sent) pacedThisSpawn = true;
+    return sent;
+}
+
 
 // ----------------------------- Discovery + boot --------------------------------
 
 // Find a REST base + state path that returns a game-state-shaped JSON, and a
 // working WS url. Falls back to overrides (TW_BASE/TW_WS) without probing.
 async function discover(): Promise<boolean> {
-    if (process.env.TW_ORACLE) {
+    if (ORACLE) {
         // Child instance utilizing Oracle. Endpoints are inherited via ENV.
         return true;
     }
@@ -1982,6 +2028,7 @@ async function runOracleParent() {
                     TW_STATE_PATH: STATE_PATH,
                     TW_DEPLOY_PATH: DEPLOY_PATH,
                     TW_ORACLE: "1", // Triggers IPC listener mode in children
+                    ...(ROOM !== null ? { TW_ROOM: String(ROOM), TW_PARTY_ROOM: String(ROOM) } : {}),
                 },
             });
             child.on("exit", (c) => console.log(`[party] bot #${botNumber} (${name || "unnamed"}) exited (${c})`));
@@ -2025,7 +2072,9 @@ async function runOracleParent() {
                     const sb = ((s.heroScoreboard ?? []) as any[]).map(adaptScore).filter((e): e is ScoreEntry => !!e);
 
                     // Share deserialized javascript object; much cheaper IPC than massive JSON raw strings
-                    const WPayload = { units, blds, sb, winner: s.winner ?? null };
+                    // rawSb rides along so children can run the skin check, which
+                    // string-searches the undecoded row.
+                    const WPayload = { units, blds, sb, winner: s.winner ?? null, rawSb: Array.isArray(s.heroScoreboard) ? s.heroScoreboard : [] };
                     children.forEach(c => {
                         try { c.send({ type: "ws", payload: WPayload }); } catch { }
                     });
@@ -2055,7 +2104,7 @@ async function runBot() {
     // Oracle architectural upgrade: 
     // If the Oracle is running, children don't even need to open a WebSocket connection!
     // This saves 18 unnecessary socket connections to the game server.
-    if (!process.env.TW_ORACLE) {
+    if (!ORACLE) {
         wsConnect();
     }
 
@@ -2065,6 +2114,7 @@ async function runBot() {
             if (msg.type === "ws") {
                 wsFrames++;
                 W = msg.payload;
+                lastRawSb = msg.payload?.rawSb ?? [];
                 lastWsSnapshotAt = now();
                 processWsSideEffects();
             } else if (msg.type === "rest") {
