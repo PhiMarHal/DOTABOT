@@ -26,6 +26,12 @@
  * TW_SKIN         skin id (default: none — base mage)
  * TW_ITEM         item id (default: ring_of_regen; free for everyone here)
  * TW_LANE         top | mid | bot  (default mid)
+ * COMMAND-LINE FLAGS
+ *   -amount N       launch N bots (same as TW_INSTANCES, wins if both given)
+ *   -balancer       keep the teams even: poll every 2s, and if one side is a
+ *                   player up for 20s straight, add a bot to the short side
+ *                   (TW_BALANCE_WAIT overrides the 20s)
+ *
  * TW_INSTANCES    launch N in-process bots from ONE command (default 1)
  * TW_JOIN_STAGGER ms between staggered instance joins (default 1500)
  * DEBUG=1 / --debug
@@ -50,9 +56,30 @@ import path from "node:path";
 // party mode. argv[1] is exactly that path, and needs no compiler options.
 const SELF_PATH = process.argv[1] ? path.resolve(process.argv[1]) : "thronebot.ts";
 
-const _INSTANCES = Math.max(1, parseInt(process.env.TW_INSTANCES ?? "1", 10) || 1);
+// ---- command-line flags -----------------------------------------------------
+//   npx tsx thronebot.ts -amount 4        start 4 bots
+//   npx tsx thronebot.ts -balancer        keep the teams even
+//   npx tsx thronebot.ts -amount 4 -balancer
+const _ARGV = process.argv.slice(2);
+const _flag = (n: string) => _ARGV.includes(`-${n}`) || _ARGV.includes(`--${n}`);
+const _val = (n: string) => {
+    const i = _ARGV.findIndex((a) => a === `-${n}` || a === `--${n}`);
+    return i >= 0 ? _ARGV[i + 1] : undefined;
+};
+const BALANCER = _flag("balancer");
+// null = flag absent. 0 is a MEANINGFUL value: "-amount 0 -balancer" means
+// launch nothing, just watch, and only add a bot if the teams go uneven.
+const _AMOUNT: number | null = _val("amount") !== undefined
+    ? Math.max(0, parseInt(_val("amount")!, 10) || 0)
+    : null;
+
+const _INSTANCES = Math.max(0, _AMOUNT ?? parseInt(process.env.TW_INSTANCES ?? "1", 10) ?? 1);
 const _STAGGER = parseInt(process.env.TW_JOIN_STAGGER ?? "1500", 10) || 1500;
-const _IS_PARENT = _INSTANCES > 1 && !process.env.TW_CHILD;
+const _IS_PARENT = (_INSTANCES !== 1 || BALANCER) && !process.env.TW_CHILD;
+if (_INSTANCES === 0 && !BALANCER) {
+    console.log("[boot] -amount 0 with no -balancer: nothing to do. Add -balancer to watch and fill in as needed.");
+    process.exit(0);
+}
 
 // ----------------------------- Config ----------------------------------------
 
@@ -92,8 +119,8 @@ function authHeaders(extra: Record<string, string> = {}): Record<string, string>
 }
 
 // Candidate hosts/paths probed at boot (same-dev DoA shapes are the template).
-const REST_CANDIDATES = [process.env.TW_BASE, "https://thronewars.gg", "https://api.thronewars.gg", "https://game.thronewars.gg", "https://server.thronewars.gg"].filter(Boolean) as string[];
-const WS_CANDIDATES = [process.env.TW_WS, "wss://thronewars.gg", "wss://api.thronewars.gg", "wss://game.thronewars.gg", "wss://server.thronewars.gg"].filter(Boolean) as string[];
+const REST_CANDIDATES = [process.env.TW_BASE, "https://game.thronewars.gg", "https://thronewars.gg", "https://api.thronewars.gg", "https://server.thronewars.gg"].filter(Boolean) as string[];
+const WS_CANDIDATES = [process.env.TW_WS, "wss://game.thronewars.gg", "wss://thronewars.gg", "wss://api.thronewars.gg", "wss://server.thronewars.gg"].filter(Boolean) as string[];
 const STATE_PATHS = ["/api/game/state", "/api/state", "/api/room/state", "/state"];
 const DEPLOY_PATHS = ["/api/strategy/deployment", "/api/deployment", "/api/deploy", "/api/play"];
 
@@ -127,9 +154,18 @@ const LOADOUT = {
 // want the free skin for whatever class you're running.
 //   melee -> Vanguard (Defensive Aura), ranged -> Centaur (Bramble Patch)
 
-const FORCED_ROOM = process.env.TW_ROOM ? parseInt(process.env.TW_ROOM, 10) : null;
+const _ROOM_ARG = _val("room");
+const FORCED_ROOM = _ROOM_ARG !== undefined ? (parseInt(_ROOM_ARG, 10) || null)
+    : process.env.TW_ROOM ? parseInt(process.env.TW_ROOM, 10) : null;
 // In party mode the parent tells us which room its shared feed is watching.
 const PARTY_ROOM = process.env.TW_PARTY_ROOM ? parseInt(process.env.TW_PARTY_ROOM, 10) : FORCED_ROOM;
+// Set by the balancer when it spawns us to even out a lopsided game.
+const PREFER_FACTION = (process.env.TW_PREFER_FACTION as Faction | undefined) || null;
+// Balancer-spawned bots exist to fill ONE round's hole. They retire when the
+// round ends so the next round starts from your real bot count and the balancer
+// re-decides from scratch — otherwise a lopsided minute permanently inflates the
+// party. TW_BALANCE_KEEP=1 makes them stay.
+const ONE_ROUND = process.env.TW_ONE_ROUND === "1" && process.env.TW_BALANCE_KEEP !== "1";
 const DEF_CLASS = LOADOUT.heroClass;
 const SKIN_CANDIDATES: string[] = LOADOUT.skin ?? [];
 const DEF_SKIN: string | undefined = SKIN_CANDIDATES[0];
@@ -832,6 +868,11 @@ function betweenRounds(): boolean {
 function noteRoundOver(winner: Faction, source: string) {
     if (roundOverAt) return;      // the winner flag sits there for several seconds
     roundOverAt = now();          // at 20 Hz — reset once, not 100 times
+    if (ONE_ROUND) {
+        console.log(`[round] over — ${winner} won. Retiring (spawned to balance one round).`);
+        setTimeout(() => process.exit(0), 250);   // let the log flush
+        return;
+    }
     console.log(`[round] over — ${winner} won (via ${source}). Rejoining next round…`);
     resetRoundState();
 }
@@ -858,6 +899,12 @@ async function lifecycleTick() {
             console.log(`[join] confirmed: ${me.faction} ${me.heroClass} in ${me.lane} as ${AGENT_NAME} (room ${ROOM ?? "?"})`);
             spawnedAt = now();
             pacedThisSpawn = false;      // arm the one opening Stroll
+            // Tell the parent which room we actually landed in, so its shared
+            // feed and its player counts follow the bots rather than a guess.
+            try { process.send?.({ type: "room", room: ROOM, faction: me.faction }); } catch { }
+            if (PREFER_FACTION)
+                console.log(`[balance] joined to fill ${PREFER_FACTION}; server put us on ${me.faction}` +
+                    `${me.faction === PREFER_FACTION ? " ✓" : " — auto-assignment disagreed with our count"}`);
             // FIX 7: say out loud what we asked for vs what we got. A skin that
             // silently doesn't apply is otherwise invisible until you notice the
             // wrong sprite on the spectator view.
@@ -1095,6 +1142,9 @@ async function maybeDeploy() {
         // TW_ROOM). Harmless if the server ignores it — it echoes back the room
         // it actually gave us, and adoptServerIdentity() follows that.
         if (ROOM !== null) body.room = ROOM;
+        // NOTE: we deliberately do NOT send a faction. The docs are explicit that
+        // you're auto-assigned to whichever side has fewer players and can't
+        // choose — which is exactly what the balancer wants anyway.
         // FIX 3: a *retry* must not re-send heroLane — that's what was firing a
         // "moved to mid" broadcast every 25s while we sat there unidentified.
         if (retryDue) delete body.heroLane;
@@ -1936,6 +1986,179 @@ async function maybeSpawnStroll(): Promise<boolean> {
 }
 
 
+// ----------------------------- Room discovery ----------------------------------
+
+// Which room is the action in? Rooms spin up and down with demand, so this can't
+// be a constant — it's 1 today and 49 yesterday.
+//
+// Cost matters here: the state endpoint returns a FULL battlefield serialization,
+// so brute-forcing 64 rooms is ~1.3 MB and 64 server-side renders per attempt.
+// That's rude and it trips the rate limiter. So we try cheap things first and
+// only sweep as a genuine last resort.
+//
+//   1. a rooms/lobby endpoint, if one exists (1 request, tiny)
+//   2. the state endpoint with NO room param — the site's "Spectate" button
+//      drops you into the current ranked game, so the server clearly has a
+//      notion of "the live room". If that response names its room, done; if it
+//      doesn't name one but has players in it, we just watch it as-is and never
+//      need a room number at all (1 request per poll, forever)
+//   3. only then, a throttled sweep with an early exit
+
+// CONFIRMED (captured from the site's Spectate button, Aug 2026):
+//   GET https://game.thronewars.gg/api/rooms
+//   {"rooms":[{"id":1,"mode":"ranked","players":2,"bots":0,"human":1,"orc":1,"tick":797,"live":true}]}
+// 98 bytes, ETag'd, and it carries PER-FACTION counts — which is everything the
+// balancer needs, without touching the battlefield state at all. The path isn't
+// documented so the fallbacks stay, but this is the one that should hit.
+const ROOM_LIST_PATHS = [
+    process.env.TW_ROOMS_PATH, "/api/rooms", "/api/game/rooms", "/api/lobby",
+    "/api/games", "/api/spectate", "/api/room/list", "/api/game/list", "/api/status",
+].filter(Boolean) as string[];
+let roomsPath: string | null | undefined = undefined;   // undefined = untried, null = none work
+
+interface RoomInfo {
+    id: number; mode: string; players: number; bots: number;
+    human: number; orc: number; tick: number; live: boolean;
+}
+
+function parseRoomList(j: any): RoomInfo[] {
+    const rows: any[] = Array.isArray(j) ? j : (j?.rooms ?? j?.games ?? j?.data ?? []);
+    if (!Array.isArray(rows)) return [];
+    const out: RoomInfo[] = [];
+    for (const r of rows) {
+        if (!r || typeof r !== "object") continue;
+        const id = r.id ?? r.room ?? r.roomId ?? r.gameId ?? r.number;
+        const n = typeof id === "string" ? parseInt(id, 10) : id;
+        if (typeof n !== "number" || !Number.isFinite(n)) continue;
+        out.push({
+            id: n,
+            mode: String(r.mode ?? "ranked"),
+            players: Number(r.players ?? r.playerCount ?? 0),
+            bots: Number(r.bots ?? 0),
+            human: Number(r.human ?? 0),
+            orc: Number(r.orc ?? 0),
+            tick: Number(r.tick ?? 0),
+            live: r.live !== false,
+        });
+    }
+    return out;
+}
+
+// The rooms endpoint is ETag'd, so a repeat poll that hasn't changed costs a 304
+// with no body. The server's rate limit is 60 per window (X-RateLimit-Limit: 60),
+// which is exactly why the old 64-request sweep was untenable — it would have
+// burned the entire budget in one go.
+let roomsEtag = "";
+let roomsCache: RoomInfo[] = [];
+let roomsCacheAt = 0;
+let rateRemaining = Infinity;
+
+async function queryRoomList(): Promise<RoomInfo[] | null> {
+    if (roomsPath === null) return null;                       // known not to exist
+    if (rateRemaining <= 8 && now() - roomsCacheAt < 10_000) return roomsCache.length ? roomsCache : null;
+    const paths = roomsPath ? [roomsPath] : ROOM_LIST_PATHS;
+    for (const p of paths) {
+        try {
+            const headers = authHeaders(roomsPath && roomsEtag ? { "If-None-Match": roomsEtag } : {});
+            const r = await fetch(`${REST_BASE}${p}`, { headers });
+            const rem = r.headers.get("x-ratelimit-remaining");
+            if (rem !== null) rateRemaining = parseInt(rem, 10);
+            if (r.status === 304) { roomsCacheAt = now(); return roomsCache; }   // unchanged, no body
+            if (!r.ok) continue;
+            const list = parseRoomList(await r.json());
+            if (!list.length) continue;
+            if (roomsPath !== p) console.log(`[room] room list at ${p} — using it instead of sweeping`);
+            roomsPath = p;
+            roomsEtag = r.headers.get("etag") ?? "";
+            roomsCache = list; roomsCacheAt = now();
+            return list;
+        } catch { /* next candidate */ }
+    }
+    if (roomsPath === undefined) roomsPath = null;
+    return null;
+}
+
+// Per-faction counts for a room, straight from the room list. No state fetch.
+function roomFactions(room: number | null): { human: number; orc: number } | null {
+    if (now() - roomsCacheAt > 12_000) return null;            // stale
+    const r = room === null ? roomsCache[0] : roomsCache.find((x) => x.id === room);
+    return r ? { human: r.human, orc: r.orc } : null;
+}
+
+// True once we've established the default (room-less) state IS the live game, in
+// which case we poll it directly and never need a room number.
+let watchDefaultRoom = false;
+let lastSweepAt = 0;
+
+async function findActiveRoom(scanTo = parseInt(process.env.TW_ROOM_SCAN ?? "64", 10) || 64): Promise<number | null> {
+    // 1. The room list. One 98-byte request, and it tells us mode + liveness too.
+    const list = await queryRoomList();
+    if (list?.length) {
+        const ranked = list.filter((r) => r.live && /ranked/i.test(r.mode));
+        const pool = ranked.length ? ranked : list.filter((r) => r.live);
+        pool.sort((a, b) => b.players - a.players);
+        if (pool.length) {
+            const r = pool[0];
+            console.log(`[room] ${r.mode} room #${r.id}: ${r.players} players (${r.human}v${r.orc}${r.bots ? `, ${r.bots} bots` : ""})`);
+            return r.id;
+        }
+    }
+
+    // 2. The default state — i.e. whatever "Spectate" would show you.
+    try {
+        const r = await fetch(`${REST_BASE}${STATE_PATH}`, { headers: authHeaders() });
+        if (r.ok) {
+            const j: any = await r.json();
+            const id = j?.room ?? j?.roomId ?? j?.gameId ?? j?.roomNumber;
+            const n = typeof id === "string" ? parseInt(id, 10) : id;
+            if (typeof n === "number" && Number.isFinite(n)) {
+                console.log(`[room] the server's default state is room ${n}`);
+                return n;
+            }
+            const players = (j?.heroes ?? j?.heroScoreboard ?? []).length;
+            const alive = Array.isArray(j?.units) || !!j?.lanes;
+            if (alive) {
+                // A live game with no room label. That's fine — it's the same game
+                // Spectate shows, and we can watch it without naming it.
+                if (!watchDefaultRoom)
+                    console.log(`[room] default state is a live game (${players} players) but doesn't name a room — ` +
+                        `watching it directly, no room number needed`);
+                watchDefaultRoom = true;
+                return null;
+            }
+        }
+    } catch { /* fall through */ }
+
+    // 3. Last resort. Throttled hard, and stops at the first populated room
+    //    rather than pricing out all 64.
+    if (now() - lastSweepAt < 5 * 60_000) return null;
+    lastSweepAt = now();
+    console.log(`[room] no room list and no default game — sweeping 1..${scanTo} (this is the expensive path)`);
+    for (let start = 1; start <= scanTo; start += 4) {
+        const batch: Promise<{ room: number; players: number } | null>[] = [];
+        for (let r = start; r < start + 4 && r <= scanTo; r++) {
+            batch.push((async () => {
+                try {
+                    const res = await fetch(`${REST_BASE}${STATE_PATH}?room=${r}`, { headers: authHeaders() });
+                    if (!res.ok) return null;
+                    const j: any = await res.json();
+                    const n = (j?.heroes ?? j?.heroScoreboard ?? []).length;
+                    return n > 0 ? { room: r, players: n } : null;
+                } catch { return null; }
+            })());
+        }
+        const hits = (await Promise.all(batch)).filter(Boolean) as { room: number; players: number }[];
+        if (hits.length) {
+            hits.sort((a, b) => b.players - a.players);
+            console.log(`[room] found room ${hits[0].room} (${hits[0].players} players) after ${start + 3} probes — stopping here`);
+            return hits[0].room;
+        }
+        await new Promise((r) => setTimeout(r, 200));
+    }
+    console.log(`[room] nothing populated in 1..${scanTo}`);
+    return null;
+}
+
 // ----------------------------- Discovery + boot --------------------------------
 
 // Find a REST base + state path that returns a game-state-shaped JSON, and a
@@ -1975,7 +2198,7 @@ async function discover(): Promise<boolean> {
                         // WS: use override, else derive from base host, else probe candidates.
                         WS_URL = process.env.TW_WS || base.replace(/^http/, "ws");
                         console.log(`[discover] ws: ${WS_URL} (will fall back through candidates if silent)`);
-                        if (ROOM === null) ROOM = FORCED_ROOM ?? 1;
+                        if (ROOM === null && FORCED_ROOM !== null) ROOM = FORCED_ROOM;   // never default to room 1
                         return true;
                     }
                 } catch { /* next */ }
@@ -1985,7 +2208,7 @@ async function discover(): Promise<boolean> {
     // Overrides provided but probing failed to confirm — trust them anyway.
     if (process.env.TW_BASE) {
         REST_BASE = process.env.TW_BASE; WS_URL = process.env.TW_WS || REST_BASE.replace(/^http/, "ws");
-        if (ROOM === null) ROOM = FORCED_ROOM ?? 1;
+        if (ROOM === null && FORCED_ROOM !== null) ROOM = FORCED_ROOM;   // never default to room 1
         console.log(`[discover] probing failed; using overrides ${REST_BASE} / ${WS_URL}`);
         return true;
     }
@@ -1994,6 +2217,32 @@ async function discover(): Promise<boolean> {
 
 // ----------------------------- Network Topology Core ---------------------------
 
+// ---- parent-side view of the game, used by the balancer ---------------------
+let oracleSb: ScoreEntry[] = [];
+let oracleSbAt = 0;
+let oracleRest: any = null;
+let oracleRestAt = 0;
+let oracleWinner: Faction | null = null;
+
+// How many players are on each side right now, ours included. Prefers the 20 Hz
+// feed and falls back to REST; returns null if neither is fresh enough to trust.
+function factionCounts(): { human: number; orc: number } | null {
+    // Cheapest source first: /api/rooms already breaks the room down by faction,
+    // so in survey mode we never need the battlefield state at all.
+    const fromList = roomFactions(ROOM);
+    if (fromList) return fromList;
+
+    const fresh = (t: number, ms: number) => t > 0 && now() - t < ms;
+    let rows: { faction: Faction }[] | null = null;
+    if (fresh(oracleSbAt, 5_000)) rows = oracleSb;
+    else if (fresh(oracleRestAt, 15_000) && Array.isArray(oracleRest?.heroes)) rows = oracleRest.heroes;
+    if (!rows) return null;
+    return {
+        human: rows.filter((h) => h.faction === "human").length,
+        orc: rows.filter((h) => h.faction === "orc").length,
+    };
+}
+
 async function runOracleParent() {
     console.log(`[party] discovering endpoints once for the party...`);
     const ok = await discover();
@@ -2001,49 +2250,121 @@ async function runOracleParent() {
         console.error("[party] discovery failed. Provide TW_BASE/TW_WS overrides.");
         process.exit(1);
     }
-    console.log(`[party] launching ${_INSTANCES} bots into room ${ROOM ?? "(auto)"} …`);
+    // Unless the user pinned a room, go and find the live one. (discover() may
+    // have set ROOM as a side effect of probing "?room=1" — that's a probe
+    // result, not a statement about where the game is.)
+    if (FORCED_ROOM === null) {
+        const found = await findActiveRoom();
+        if (found !== null) ROOM = found;
+        else if (watchDefaultRoom) ROOM = null;
+    }
+
+    if (_INSTANCES === 0) {
+        console.log(`[party] survey only — no bots launched. Watching room ${ROOM ?? "(server default)"} for uneven teams.`);
+        if (ROOM === null && !watchDefaultRoom)
+            console.log(`[party] NOTE: couldn't find a populated room. Will keep looking every 2 minutes.`);
+    } else {
+        console.log(`[party] launching ${_INSTANCES} bot${_INSTANCES === 1 ? "" : "s"} into room ${ROOM ?? "(auto)"}` +
+            `${BALANCER ? " | balancer ON" : ""} …`);
+    }
 
     const children: import("child_process").ChildProcess[] = [];
-    for (let i = 0; i < _INSTANCES; i++) {
-        setTimeout(() => {
-            const botNumber = i + 1;
-            const auth = process.env[`TW_AUTH_${botNumber}`] || process.env.TW_AUTH || "";
-            const name = process.env[`TW_NAME_${botNumber}`] || process.env.TW_NAME || "";
+    const usedSlots = new Set<number>();
 
-            if (!auth) {
-                console.log(`[party] bot #${botNumber} has NO token — skipping`);
-                return;
-            }
-
-            const child = spawn(process.execPath, ["--import", "tsx", SELF_PATH], {
-                stdio: ["inherit", "inherit", "inherit", "ipc"],
-                env: {
-                    ...process.env,
-                    TW_CHILD: String(botNumber),
-                    TW_INSTANCES: "1",
-                    TW_AUTH: auth,
-                    TW_NAME: name,
-                    TW_BASE: REST_BASE,
-                    TW_WS: WS_URL,
-                    TW_STATE_PATH: STATE_PATH,
-                    TW_DEPLOY_PATH: DEPLOY_PATH,
-                    TW_ORACLE: "1", // Triggers IPC listener mode in children
-                    ...(ROOM !== null ? { TW_ROOM: String(ROOM), TW_PARTY_ROOM: String(ROOM) } : {}),
-                },
-            });
-            child.on("exit", (c) => console.log(`[party] bot #${botNumber} (${name || "unnamed"}) exited (${c})`));
-            children.push(child);
-        }, i * _STAGGER);
+    // A one-round balancer bot exits mid-match, and there's a window between its
+    // IPC channel closing and the parent's "exit" handler removing it from this
+    // list. A plain c.send() in that window throws ERR_IPC_CHANNEL_CLOSED — and
+    // because it surfaces as an 'error' EVENT on the ChildProcess rather than a
+    // thrown exception, a try/catch around the send does NOT catch it. Unhandled,
+    // it takes down the whole parent (and with it the balancer).
+    // Passing a callback makes node hand us the error instead of emitting it.
+    function safeSend(c: import("child_process").ChildProcess, msg: any) {
+        if (!c.connected) return;
+        try { c.send(msg, undefined, undefined, () => { /* channel closed mid-flight */ }); }
+        catch { /* already gone */ }
     }
+    let partyRoomLocked = false;
+    // The bot we most recently added to fix a lopsided game, pending a check on
+    // whether it actually helped. Cancelled if it retires or the round ends
+    // first — otherwise we'd score our own success as a failure.
+    let addedSlot: number | null = null;
+    let diffBeforeAdd = 0;
+
+    // A slot is usable if it has its own token in .env.
+    const tokenFor = (slot: number) => process.env[`TW_AUTH_${slot}`] || (slot === 1 ? process.env.TW_AUTH ?? "" : "");
+    function freeSlot(): number | null {
+        for (let n = 1; n <= 64; n++) if (!usedSlots.has(n) && tokenFor(n)) return n;
+        return null;
+    }
+
+    function spawnBot(slot: number, opts: { faction?: Faction } = {}): boolean {
+        if (usedSlots.has(slot)) return false;
+        const auth = tokenFor(slot);
+        const name = process.env[`TW_NAME_${slot}`] || (slot === 1 ? process.env.TW_NAME ?? "" : "");
+        if (!auth) { console.log(`[party] bot #${slot} has NO token — skipping`); return false; }
+        usedSlots.add(slot);
+
+        const child = spawn(process.execPath, ["--import", "tsx", SELF_PATH], {
+            stdio: ["inherit", "inherit", "inherit", "ipc"],
+            env: {
+                ...process.env,
+                TW_CHILD: String(slot),
+                TW_INSTANCES: "1",
+                TW_AUTH: auth,
+                TW_NAME: name,
+                TW_BASE: REST_BASE,
+                TW_WS: WS_URL,
+                TW_STATE_PATH: STATE_PATH,
+                TW_DEPLOY_PATH: DEPLOY_PATH,
+                TW_ORACLE: "1", // Triggers IPC listener mode in children
+                ...(ROOM !== null ? { TW_ROOM: String(ROOM), TW_PARTY_ROOM: String(ROOM) } : {}),
+                ...(opts.faction ? { TW_PREFER_FACTION: opts.faction, TW_ONE_ROUND: "1" } : {}),
+            },
+        });
+
+        // Children report the room they actually landed in. The first one to
+        // report sets the party room: the shared feed and the balancer's player
+        // counts have to watch where the bots really are, not where we guessed.
+        child.on("message", (msg: any) => {
+            if (msg?.type !== "room" || typeof msg.room !== "number") return;
+            if (!partyRoomLocked && msg.room !== ROOM) {
+                console.log(`[party] following bot #${slot} into room ${msg.room} (was ${ROOM ?? "auto"})`);
+                ROOM = msg.room;
+                try { oracleWsConn?.close(); } catch { }   // reconnects to the new room
+            }
+            partyRoomLocked = true;
+        });
+        const forget = () => {
+            const i = children.indexOf(child); if (i >= 0) children.splice(i, 1);
+        };
+        // 'disconnect' fires when the IPC channel closes, which is EARLIER than
+        // 'exit' — that gap is the bug above. Drop the child at the first sign.
+        child.on("disconnect", forget);
+        child.on("error", (e) => { forget(); console.log(`[party] bot #${slot} channel error: ${e.message}`); });
+        child.on("exit", (c) => {
+            usedSlots.delete(slot);
+            if (addedSlot === slot) addedSlot = null;    // retired before the check: not a strike
+            forget();
+            console.log(`[party] bot #${slot} (${name || "unnamed"}) exited (${c})`);
+        });
+        children.push(child);
+        return true;
+    }
+
+    for (let i = 0; i < _INSTANCES; i++) setTimeout(() => spawnBot(i + 1), i * _STAGGER);
 
     // 1. Oracle REST Poller (Eliminates 18 redundant REST queries)
     setInterval(async () => {
+        // Skip only when the room list is answering for us. With no children AND
+        // no room list, this poll is the balancer's only source of counts.
+        if (!children.length && roomFactions(ROOM)) return;
         try {
             const q = ROOM !== null ? `?room=${ROOM}` : "";
             const r = await fetch(`${REST_BASE}${STATE_PATH}${q}`, { headers: authHeaders() });
             if (!r.ok) return;
             const restData = await r.json();
-            children.forEach(c => c.send({ type: "rest", payload: restData }));
+            oracleRest = restData; oracleRestAt = now();
+            children.forEach((c) => safeSend(c, { type: "rest", payload: restData }));
         } catch (e) { }
     }, CFG.restPollMs);
 
@@ -2075,9 +2396,8 @@ async function runOracleParent() {
                     // rawSb rides along so children can run the skin check, which
                     // string-searches the undecoded row.
                     const WPayload = { units, blds, sb, winner: s.winner ?? null, rawSb: Array.isArray(s.heroScoreboard) ? s.heroScoreboard : [] };
-                    children.forEach(c => {
-                        try { c.send({ type: "ws", payload: WPayload }); } catch { }
-                    });
+                    oracleSb = sb; oracleSbAt = now(); oracleWinner = s.winner ?? null;
+                    children.forEach((c) => safeSend(c, { type: "ws", payload: WPayload }));
                 }
             } catch { }
         });
@@ -2087,7 +2407,117 @@ async function runOracleParent() {
         });
         oracleWsConn.on("error", (e) => console.log("[oracle] ws error:", (e as Error).message));
     }
-    connectOracleWs();
+    // In survey mode (no bots of our own) the shared feed has no consumers, so
+    // don't open a socket or poll the battlefield at all — the room list alone
+    // answers "are the teams even?". The feed starts the moment we spawn a bot.
+    let oracleFeedStarted = false;
+    function ensureOracleFeed() {
+        if (oracleFeedStarted) return;
+        oracleFeedStarted = true;
+        connectOracleWs();
+    }
+    if (_INSTANCES > 0) ensureOracleFeed();
+    else console.log(`[party] survey mode — polling the room list only, no game socket opened`);
+
+    // Keep the room list warm; ETag means an unchanged poll is a bodyless 304.
+    setInterval(() => { void queryRoomList(); }, _INSTANCES > 0 ? 10_000 : 3_000);
+
+    // ---- 3. BALANCER --------------------------------------------------------
+    // Watch the teams every 2s. If one side is a player up, give a human 20s to
+    // take the empty slot before we fill it ourselves.
+    if (!BALANCER) return;
+    const BALANCE_WAIT_MS = parseInt(process.env.TW_BALANCE_WAIT ?? "20000", 10) || 20_000;
+    const SETTLE_MS = 30_000;          // after adding, let the new bot actually land
+    let unevenSince = 0;
+    let lastAddAt = 0;
+    let announced = false;
+    let balancerArmed = true;      // disarmed if our adds demonstrably backfire
+    let noHelpStrikes = 0;
+
+    console.log(`[balance] on — checking every 2s, filling an empty slot after ${BALANCE_WAIT_MS / 1000}s`);
+
+    // Rooms come and go, and the game we're watching will empty out between
+    // sessions. If the room we're on has no players, go find where everyone went.
+    let lastRoomHuntAt = 0;
+    setInterval(async () => {
+        const c0 = factionCounts();
+        const empty = !c0 || (c0.human + c0.orc) === 0;
+        if (!empty || usedSlots.size > 0) return;        // busy, or our own bots are in it
+        if (now() - lastRoomHuntAt < 120_000) return;    // idle polling should be cheap
+        lastRoomHuntAt = now();
+        const found = await findActiveRoom();
+        if (found === null && watchDefaultRoom) return;   // already on the live game
+        if (found !== null && found !== ROOM) {
+            console.log(`[room] the game moved — watching room ${found} now (was ${ROOM ?? "none"})`);
+            ROOM = found;
+            try { oracleWsConn?.close(); } catch { }
+        }
+    }, 10_000);
+
+    setInterval(() => {
+        const c = factionCounts();
+        if (!c) return;                                  // no trustworthy view yet
+        if (oracleWinner) {                              // round is over; counts are meaningless
+            unevenSince = 0;
+            addedSlot = null;                            // and the add can't be judged across it
+            return;
+        }
+
+        const diff = c.human - c.orc;
+
+        // Did the last bot we added actually help? We can ASK for a faction, but
+        // the server may auto-assign regardless — and if it does, every bot we
+        // send makes the game more lopsided, not less. Check once, then stop.
+        if (addedSlot !== null && now() - lastAddAt > SETTLE_MS) {
+            // A bot that landed on the short side takes |diff| down by one. If it
+            // didn't, either the server ignored the faction request or the bot
+            // never joined — and repeating that just feeds tokens into the wrong
+            // team. Two strikes (so one coincidental leaver doesn't disarm us).
+            if (Math.abs(diff) >= diffBeforeAdd) {
+                noHelpStrikes++;
+                console.log(`[balance] bot #${addedSlot} didn't even the teams (${diffBeforeAdd} -> ${Math.abs(diff)} apart)` +
+                    `${noHelpStrikes < 2 ? " — one more try" : ""}`);
+                if (noHelpStrikes >= 2) {
+                    balancerArmed = false;
+                    console.log(`[balance] DISARMED — adding bots isn't helping, so the server is assigning ` +
+                        `factions its own way. Not adding more this session.`);
+                }
+            } else {
+                noHelpStrikes = 0;
+                console.log(`[balance] bot #${addedSlot} evened it up — now ${c.human}v${c.orc}`);
+            }
+            addedSlot = null;
+        }
+        if (!balancerArmed) return;
+
+        if (Math.abs(diff) < 1) {
+            if (unevenSince && announced) console.log(`[balance] even again (${c.human}v${c.orc})`);
+            unevenSince = 0; announced = false;
+            return;
+        }
+        if (!unevenSince) {
+            unevenSince = now(); announced = true;
+            console.log(`[balance] uneven ${c.human}v${c.orc} — holding ${BALANCE_WAIT_MS / 1000}s in case a human joins`);
+            return;
+        }
+        if (now() - unevenSince < BALANCE_WAIT_MS) return;
+        if (now() - lastAddAt < SETTLE_MS) return;       // one at a time
+
+        const short: Faction = diff > 0 ? "orc" : "human";
+        const slot = freeSlot();
+        if (!slot) {
+            console.log(`[balance] ${short} is short a player but every token is already in game — ` +
+                `add another TW_AUTH_n to .env if you want deeper benches`);
+            unevenSince = 0; announced = false;
+            return;
+        }
+        console.log(`[balance] still ${c.human}v${c.orc} after ${BALANCE_WAIT_MS / 1000}s — sending bot #${slot} to fill ${short}` +
+            `${process.env.TW_BALANCE_KEEP === "1" ? "" : " (retires at end of round)"}`);
+        lastAddAt = now(); unevenSince = 0; announced = false;
+        diffBeforeAdd = Math.abs(diff); addedSlot = slot;
+        ensureOracleFeed();          // the new bot needs the shared feed
+        spawnBot(slot, { faction: short });
+    }, 2_000);
 }
 
 async function runBot() {
