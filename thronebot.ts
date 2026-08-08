@@ -869,8 +869,16 @@ function noteRoundOver(winner: Faction, source: string) {
     if (roundOverAt) return;      // the winner flag sits there for several seconds
     roundOverAt = now();          // at 20 Hz — reset once, not 100 times
     if (ONE_ROUND) {
-        console.log(`[round] over — ${winner} won. Retiring (spawned to balance one round).`);
-        setTimeout(() => process.exit(0), 250);   // let the log flush
+        if (benched) { resetRoundState(); return; }   // already dormant, don't re-announce
+        // We used to process.exit() here. On Windows that killed the whole
+        // console process group — the parent (and with it the balancer) died and
+        // cmd printed "Terminate batch job (Y/N)?". Nothing needs a process to
+        // die: go dormant instead and wait for the balancer to call us back in.
+        // Cheaper too — no re-spawn, no re-discovery, no IPC teardown race.
+        benched = true;
+        console.log(`[round] over — ${winner} won. Benched (spawned to balance one round); waiting to be called back in.`);
+        try { process.send?.({ type: "benched" }); } catch { }
+        resetRoundState();
         return;
     }
     console.log(`[round] over — ${winner} won (via ${source}). Rejoining next round…`);
@@ -1001,8 +1009,17 @@ function adoptServerIdentity(text: string): void {
     }
     const room = j.room ?? j.roomId ?? j.roomNumber ?? j.gameId ?? nested.room;
     const n = typeof room === "string" ? parseInt(room, 10) : room;
-    if (typeof n === "number" && Number.isFinite(n) && ORACLE && n !== PARTY_ROOM)
-        defectFromOracle(`quick-join put us in room ${n}, the party is in ${PARTY_ROOM ?? "another room"}`);
+    if (typeof n === "number" && Number.isFinite(n) && ORACLE && n !== PARTY_ROOM) {
+        // Don't bail out of the shared feed immediately. We report our room to the
+        // parent on join, and the parent now follows us — so give it a few seconds
+        // to move its socket before paying for a second connection. (Defecting
+        // instantly also produced a stray "[ws] error: closed before the
+        // connection was established" as the two sockets raced.)
+        console.log(`[party] we're in room ${n}, the party feed is on ${PARTY_ROOM ?? "another room"} — giving the parent 6s to follow`);
+        setTimeout(() => {
+            if (ORACLE && !mySb()) defectFromOracle(`the shared feed still doesn't show us in room ${n}`);
+        }, 6_000);
+    }
     if (typeof n === "number" && Number.isFinite(n) && n !== ROOM) {
         console.log(`[id] server placed us in room ${n} (we were watching ${ROOM ?? "none"}) — following`);
         ROOM = n;
@@ -1111,6 +1128,7 @@ async function pickIfPending(heroClass: HeroClass, abilities: Ability[], choices
 
 let acceptedDeploys = 0;
 async function maybeDeploy() {
+    if (benched) return;             // dormant until the balancer calls us in
     if (deployInFlight) return;
     if (now() - lastDeployFailAt < 4000) return;
     // Don't deploy into a round that's already decided — wait for the next one.
@@ -1340,6 +1358,7 @@ function onWsSnapshot(s: any, rawText: string) {
 
 let missingSinceAt = 0;
 let spawnedAt = 0;      // when our hero last entered the world
+let benched = false;    // balancer bot between rounds: alive, but not playing
 function processWsSideEffects() {
     // Round over, seen on the fast feed (see FIX 6).
     if (W?.winner) { noteRoundOver(W.winner, "WS"); return; }
@@ -2081,7 +2100,11 @@ async function queryRoomList(): Promise<RoomInfo[] | null> {
 // Per-faction counts for a room, straight from the room list. No state fetch.
 function roomFactions(room: number | null): { human: number; orc: number } | null {
     if (now() - roomsCacheAt > 12_000) return null;            // stale
-    const r = room === null ? roomsCache[0] : roomsCache.find((x) => x.id === room);
+    // Exact match only. This used to fall back to roomsCache[0] when the room
+    // was unknown, which silently reported counts for a DIFFERENT game — the
+    // balancer would then sit there seeing a permanently even scoreline.
+    if (room === null) return null;
+    const r = roomsCache.find((x) => x.id === room);
     return r ? { human: r.human, orc: r.orc } : null;
 }
 
@@ -2223,6 +2246,12 @@ let oracleSbAt = 0;
 let oracleRest: any = null;
 let oracleRestAt = 0;
 let oracleWinner: Faction | null = null;
+let oracleWinnerAt = 0;
+// The winner flag is only ever refreshed by an incoming WS frame. If the feed
+// goes quiet (socket dropped, room recycled), the last value sticks — and the
+// balancer's "round is over, counts are meaningless" gate would then return on
+// every tick for the rest of the session. Only honour a RECENT winner.
+const roundIsOver = () => !!oracleWinner && now() - oracleWinnerAt < 10_000;
 
 // How many players are on each side right now, ours included. Prefers the 20 Hz
 // feed and falls back to REST; returns null if neither is fresh enough to trust.
@@ -2283,11 +2312,12 @@ async function runOracleParent() {
         try { c.send(msg, undefined, undefined, () => { /* channel closed mid-flight */ }); }
         catch { /* already gone */ }
     }
-    let partyRoomLocked = false;
     // The bot we most recently added to fix a lopsided game, pending a check on
     // whether it actually helped. Cancelled if it retires or the round ends
     // first — otherwise we'd score our own success as a failure.
     let addedSlot: number | null = null;
+    let addedFaction: Faction | null = null;
+    let noHelpStrikes = 0;
     let diffBeforeAdd = 0;
 
     // A slot is usable if it has its own token in .env.
@@ -2297,7 +2327,19 @@ async function runOracleParent() {
         return null;
     }
 
+    const bench = new Map<number, import("child_process").ChildProcess>();
+
     function spawnBot(slot: number, opts: { faction?: Faction } = {}): boolean {
+        // A bot we benched last round is still alive and already discovered,
+        // authenticated and connected — just call it back in.
+        const dormant = bench.get(slot);
+        if (dormant) {
+            bench.delete(slot);
+            usedSlots.add(slot);
+            console.log(`[party] calling benched bot #${slot} back in`);
+            safeSend(dormant, { type: "unbench" });
+            return true;
+        }
         if (usedSlots.has(slot)) return false;
         const auth = tokenFor(slot);
         const name = process.env[`TW_NAME_${slot}`] || (slot === 1 ? process.env.TW_NAME ?? "" : "");
@@ -2326,16 +2368,35 @@ async function runOracleParent() {
         // report sets the party room: the shared feed and the balancer's player
         // counts have to watch where the bots really are, not where we guessed.
         child.on("message", (msg: any) => {
+            if (msg?.type === "benched") {
+                // Free the slot but keep the process: the balancer can re-use it
+                // next round without paying for a spawn.
+                usedSlots.delete(slot);
+                bench.set(slot, child);
+                console.log(`[party] bot #${slot} benched (idle, reusable)`);
+                return;
+            }
             if (msg?.type !== "room" || typeof msg.room !== "number") return;
-            if (!partyRoomLocked && msg.room !== ROOM) {
+            // The bot telling us which side it landed on is a far better signal
+            // than diffing player counts 30s later, which other joins and leaves
+            // can spoil (that's the false "didn't even the teams" strike).
+            if (addedSlot === slot && msg.faction && msg.faction === addedFaction) {
+                console.log(`[balance] bot #${slot} joined ${msg.faction} as intended`);
+                addedSlot = null; noHelpStrikes = 0;
+            }
+            // Follow on EVERY report, not just the first. Rooms are recycled
+            // between rounds (room 1 one session, 92 the next), and a one-shot
+            // lock left the parent's feed and player counts pointed at a room
+            // its bots had long since left.
+            if (msg.room !== ROOM) {
                 console.log(`[party] following bot #${slot} into room ${msg.room} (was ${ROOM ?? "auto"})`);
                 ROOM = msg.room;
                 try { oracleWsConn?.close(); } catch { }   // reconnects to the new room
             }
-            partyRoomLocked = true;
         });
         const forget = () => {
             const i = children.indexOf(child); if (i >= 0) children.splice(i, 1);
+            bench.delete(slot);
         };
         // 'disconnect' fires when the IPC channel closes, which is EARLIER than
         // 'exit' — that gap is the bug above. Drop the child at the first sign.
@@ -2396,7 +2457,9 @@ async function runOracleParent() {
                     // rawSb rides along so children can run the skin check, which
                     // string-searches the undecoded row.
                     const WPayload = { units, blds, sb, winner: s.winner ?? null, rawSb: Array.isArray(s.heroScoreboard) ? s.heroScoreboard : [] };
-                    oracleSb = sb; oracleSbAt = now(); oracleWinner = s.winner ?? null;
+                    oracleSb = sb; oracleSbAt = now();
+                    oracleWinner = s.winner ?? null;
+                    if (oracleWinner) oracleWinnerAt = now();
                     children.forEach((c) => safeSend(c, { type: "ws", payload: WPayload }));
                 }
             } catch { }
@@ -2432,7 +2495,8 @@ async function runOracleParent() {
     let lastAddAt = 0;
     let announced = false;
     let balancerArmed = true;      // disarmed if our adds demonstrably backfire
-    let noHelpStrikes = 0;
+    let disarmedAt = 0;
+    const REARM_MS = 10 * 60_000;
 
     console.log(`[balance] on — checking every 2s, filling an empty slot after ${BALANCE_WAIT_MS / 1000}s`);
 
@@ -2454,9 +2518,20 @@ async function runOracleParent() {
         }
     }, 10_000);
 
+    // Every gate below returns silently, which is why a stuck balancer was
+    // invisible in the logs. Once a minute, say what we see and why we're idle.
+    let lastIdleLogAt = now();
+    function idleReport(reason: string, c: { human: number; orc: number } | null) {
+        if (now() - lastIdleLogAt < 60_000) return;
+        lastIdleLogAt = now();
+        const src = roomFactions(ROOM) ? "room-list" : oracleSbAt ? "scoreboard" : "none";
+        console.log(`[balance] idle — ${reason} | room=${ROOM ?? "?"} counts=${c ? `${c.human}v${c.orc}` : "unknown"} ` +
+            `src=${src} armed=${balancerArmed} bots=${usedSlots.size} spare-token=${freeSlot() !== null}`);
+    }
+
     setInterval(() => {
         const c = factionCounts();
-        if (!c) return;                                  // no trustworthy view yet
+        if (!c) { idleReport("no player counts available", null); return; }
         if (oracleWinner) {                              // round is over; counts are meaningless
             unevenSince = 0;
             addedSlot = null;                            // and the add can't be judged across it
@@ -2479,8 +2554,9 @@ async function runOracleParent() {
                     `${noHelpStrikes < 2 ? " — one more try" : ""}`);
                 if (noHelpStrikes >= 2) {
                     balancerArmed = false;
-                    console.log(`[balance] DISARMED — adding bots isn't helping, so the server is assigning ` +
-                        `factions its own way. Not adding more this session.`);
+                    disarmedAt = now();
+                    console.log(`[balance] DISARMED for ${REARM_MS / 60_000} minutes — two adds in a row didn't ` +
+                        `even the teams. Something about the counts or the join isn't what we think.`);
                 }
             } else {
                 noHelpStrikes = 0;
@@ -2488,11 +2564,19 @@ async function runOracleParent() {
             }
             addedSlot = null;
         }
-        if (!balancerArmed) return;
+        if (!balancerArmed) {
+            // Recoverable, not terminal. The old version disarmed for the whole
+            // session, so one bad pair of adds meant the balancer silently never
+            // worked again.
+            if (now() - disarmedAt < REARM_MS) { idleReport("disarmed", c); return; }
+            balancerArmed = true; noHelpStrikes = 0;
+            console.log(`[balance] re-armed after ${REARM_MS / 60_000} minutes`);
+        }
 
         if (Math.abs(diff) < 1) {
             if (unevenSince && announced) console.log(`[balance] even again (${c.human}v${c.orc})`);
             unevenSince = 0; announced = false;
+            idleReport("teams are even", c);
             return;
         }
         if (!unevenSince) {
@@ -2512,9 +2596,9 @@ async function runOracleParent() {
             return;
         }
         console.log(`[balance] still ${c.human}v${c.orc} after ${BALANCE_WAIT_MS / 1000}s — sending bot #${slot} to fill ${short}` +
-            `${process.env.TW_BALANCE_KEEP === "1" ? "" : " (retires at end of round)"}`);
+            `${process.env.TW_BALANCE_KEEP === "1" ? "" : " (benches at end of round)"}`);
         lastAddAt = now(); unevenSince = 0; announced = false;
-        diffBeforeAdd = Math.abs(diff); addedSlot = slot;
+        diffBeforeAdd = Math.abs(diff); addedSlot = slot; addedFaction = short;
         ensureOracleFeed();          // the new bot needs the shared feed
         spawnBot(slot, { faction: short });
     }, 2_000);
@@ -2536,6 +2620,17 @@ async function runBot() {
     // This saves 18 unnecessary socket connections to the game server.
     if (!ORACLE) {
         wsConnect();
+    }
+
+    // Balancer control channel — works whether or not we're on the shared feed.
+    if (process.send) {
+        process.on("message", (msg: any) => {
+            if (msg?.type !== "unbench") return;
+            if (!benched) return;
+            benched = false;
+            console.log("[round] called back in by the balancer — deploying for this round");
+            resetRoundState();
+        });
     }
 
     // 1. IPC Listener (replaces native network fetching if Oracle is running)

@@ -1,33 +1,42 @@
 ===============================================================================
- DEFENSE OF THE AGENTS — MELEE CLASSIC BOT   (help.txt)
+ THRONE WARS — THRONEBOT   (help.txt)
 ===============================================================================
 
-A high-performance, non-LLM bot for Defense of the Agents. It connects to the
-game's real-time WebSocket feed, keeps a live model of the battlefield, and
+A high-performance, non-LLM bot for Throne Wars (thronewars.gg). It connects to
+the game's real-time WebSocket feed, keeps a live model of the battlefield, and
 plays actively (several decisions per second) instead of the lazy 2-minute poll
 most agents use. It is hard-locked to the strategy we tuned together:
 
-    Melee hero, "Classic" skin (Defensive Aura), Ring of Regen, stack mid,
-    played on Game 3 (the AI-ranked queue).
+    Mage hero, "Throne of Bones" skin (Fury -> Skeleton Archers), Cat Ears,
+    stack mid, ranked.
+
+    USAGE:  npx tsx thronebot.ts [-amount N] [-balancer] [-room N]
+            (full details in section 4)
+
+  NOTE: this bot descends from a Defense of the Agents build. The core game is
+  identical; the web3 parts are gone. If you find a stale reference to DoA,
+  wc2a_ keys, "Game 3" or connect-wallet.ts anywhere, it's a leftover — the
+  wallet flow does not apply to Throne Wars.
 
 
 -------------------------------------------------------------------------------
- 1. THE FILES  (this is the entire project)
+ 1. THE FILES
 -------------------------------------------------------------------------------
 
-  bot.ts             The bot. Run this to play.
-  connect-wallet.ts  OPTIONAL one-time helper to link a wallet (for NFT items).
-                     You do NOT need this unless you want wallet-gated items.
-  package.json       Lists the libraries the bot needs (ws, viem, dotenv).
-  .env.example       Template for your secrets. Safe to commit (no real values).
-  .gitignore         Tells git to never commit .env, node_modules/, logs, etc.
-  help.txt           This file.
+  thronebot.ts     The bot. Run this to play.
+  probe.ts         Diagnostic. Dumps what the server's API actually looks like
+                   today. Run it when something breaks (see section 12).
+  mock-server.mjs  A fake Throne Wars server for testing changes offline.
+                   Not the real API — a test fixture. See section 11.
+  build-test.ts    Simulates a full ability draft and prints the pick order.
+  package.json     Lists the libraries the bot needs (ws, dotenv, tsx).
+  .env.example     Template for your secrets. Safe to commit (no real values).
+  .gitignore       Tells git to never commit .env, node_modules/, logs, etc.
+  FIXES.md         Detailed write-up of every bug fixed and why.
+  help.txt         This file.
 
-  YOU create one more file, ".env" (from the template), holding your real API
-  key. It is git-ignored, so it never gets committed. See section 3.
-
-  After you run "npm i", a node_modules/ folder and a lockfile appear
-  automatically. Those are generated — ignore them, don't edit them.
+  YOU create one more file, ".env" (from the template), holding your real
+  token(s). It is git-ignored, so it never gets committed. See section 3.
 
 
 -------------------------------------------------------------------------------
@@ -35,222 +44,382 @@ most agents use. It is hard-locked to the strategy we tuned together:
 -------------------------------------------------------------------------------
 
   a) Node.js version 18 or newer.  Check with:   node --version
-     (If you don't have it, install the "LTS" build from nodejs.org.)
 
-  b) An agent API key. Registration is a ONE-TIME browser step:
-       1. Open  https://defenseoftheagents.com/agent  in any browser.
-       2. Pick an agent name, pass the captcha, click "Create Agent".
-       3. Copy the API key (starts with wc2a_...). It is shown ONCE — save it.
+  b) An agent token per bot. Each bot needs its OWN token — they are separate
+     accounts, with separate Silver and separate items.
 
 
 -------------------------------------------------------------------------------
- 3. QUICK START  (copy-paste, in order)
+ 3. QUICK START
 -------------------------------------------------------------------------------
 
-  Put the files in a folder, open a terminal in that folder, then:
-
-    # 1. install the libraries (one time)
-    npm i
-
-    # 2. create your secrets file from the template:
+    npm i                           # one time
     cp .env.example .env            # Windows:  copy .env.example .env
 
-    # 3. open .env in any text editor and paste in your two values:
-    #      DOTA_API_KEY=wc2a_your_real_key
-    #      DOTA_AGENT_NAME=YourBotName
+  Open .env and fill in:
 
-    # 4. run the bot:
+      TW_AUTH_1=Bearer your-token-here
+      TW_NAME_1=YourBotName
+
+  Then:
+
     npx tsx thronebot.ts
 
-  That's it. The bot reads .env automatically, joins Game 3, spawns a
-  melee/classic hero in mid, and starts playing. Leave the terminal open —
-  it plays as long as it runs.
+  ONLY SECRETS GO IN .env. Class, skin, lane and item are strategy, and they
+  live in the LOADOUT block at the top of thronebot.ts. See section 7.
 
-  COMMITTING TO GITHUB SAFELY
-  ---------------------------
-  Thanks to .gitignore, your secrets stay out of git automatically. What DOES
-  get committed: bot.ts, connect-wallet.ts, package.json, package-lock.json,
-  .env.example, .gitignore, help.txt. What NEVER gets committed: .env and
-  node_modules/. Before your first push, sanity-check with:
+  That runs ONE bot. To run several, or to keep the teams even automatically,
+  see the command-line arguments in section 4:
 
-      git status            # .env must NOT appear in the list
-
-  If it ever does, stop — it means .gitignore isn't in the folder git is
-  tracking. (Also: if you had already committed a real key earlier, rotate it
-  by making a new agent — git history keeps old commits.)
+    npx tsx thronebot.ts -amount 4               four bots
+    npx tsx thronebot.ts -amount 0 -balancer     watch, and only fill a gap
 
 
 -------------------------------------------------------------------------------
- 4. WHAT YOU'LL SEE IN THE TERMINAL  (log guide)
+ 4. COMMAND-LINE ARGUMENTS
 -------------------------------------------------------------------------------
 
-  [boot] ...            The bot started.
+  npx tsx thronebot.ts [-amount N] [-balancer] [-room N]
+
+  -amount N
+      Launch N bots at once. Bot #n uses TW_AUTH_n / TW_NAME_n from .env, so
+      "-amount 4" needs TW_AUTH_1 through TW_AUTH_4. A slot with no token is
+      skipped with a log line rather than failing the launch.
+      Same thing as TW_INSTANCES; the flag wins if both are set.
+
+      -amount 0   launches NOTHING. Only useful together with -balancer:
+                  it makes the process a pure observer that sits and watches,
+                  and adds a bot only if the teams actually go uneven.
+
+  -balancer
+      Keeps the teams even. Every 2 seconds it counts the players on each side.
+      If one side is a player up, it starts a 20-second timer — the point being
+      to give a real human the chance to take the slot. If the game is STILL
+      uneven when the timer expires, it launches one more bot to even it out.
+      Throne Wars assigns your faction automatically — you're put on whichever
+      side has fewer players and can't choose — so the new bot lands on the
+      correct side by construction.
+
+      Only ever one bot at a time, with a 30-second settle before the next
+      decision. It won't act while a round is being scored (between-round
+      player counts are meaningless).
+
+      TW_BALANCE_WAIT=30000 in .env overrides the 20-second hold.
+
+  -room N
+      Pin a specific room. N is the ?room= number in the game URL.
+      Normally UNNECESSARY, including in survey mode: rooms spin up and down
+      with demand (the main game is room 1 today, 49 yesterday), so the bot
+      finds the live one by itself. Use this only to force a particular room.
+
+  EXAMPLES
+
+    npx tsx thronebot.ts                          one bot, plays normally
+    npx tsx thronebot.ts -amount 6                six bots
+    npx tsx thronebot.ts -amount 0 -balancer      launch nothing; watch the
+                                                  live game and add a bot only
+                                                  if the teams go uneven
+    npx tsx thronebot.ts -amount 0 -balancer -room 49
+                                                  same, but pinned to room 49
+    npx tsx thronebot.ts -amount 6 -balancer      six bots + keep it even
+
+  BALANCER BOTS BENCH AT THE END OF THE ROUND. They stay alive but stop
+  playing, so the next round starts back at your -amount number and the
+  balancer decides again from scratch. A benched bot is re-used instantly if
+  it's needed again — no re-launch, no re-discovery. That's deliberate: one bad minute
+  shouldn't permanently inflate your party. It does mean the teams are uneven
+  for the first ~20s of a round while the hold timer runs, which is the same
+  window a human gets to take the slot.
+      TW_BALANCE_KEEP=1 in .env makes them stay for good instead.
+
+  HOW ROOMS ARE FOUND: the bot uses the same endpoint the site's Spectate
+  button uses —
+
+      GET https://game.thronewars.gg/api/rooms
+      {"rooms":[{"id":1,"mode":"ranked","players":2,"bots":0,
+                 "human":1,"orc":1,"tick":797,"live":true}]}
+
+  98 bytes, and it carries per-faction counts, so the balancer never has to
+  touch the battlefield state at all. It picks the live ranked room with the
+  most players (practice rooms are ignored). Responses are ETag'd, so an
+  unchanged poll comes back as a bodyless 304.
+
+  If the dev ever moves that endpoint, the bot falls back to: the state
+  endpoint with no room parameter, and finally a throttled sweep of rooms
+  1..64 capped to once per 5 minutes. Both are much more expensive — the
+  server's rate limit is 60 requests per window, so a 64-room sweep would
+  burn the entire budget in one go.
+      TW_ROOMS_PATH=/api/whatever   pins the endpoint if it moves
+      TW_ROOM_SCAN=100              widens the last-resort sweep
+
+  A SAFETY YOU SHOULD KNOW ABOUT: the balancer checks its own work. A bot that
+  lands on the short side closes the gap by one. If it doesn't, that's a strike,
+  and two strikes disarms the balancer for the session, with a log line saying
+  so. This exists so a faction-assignment surprise can't feed every token you
+  own into the wrong team.
+
+  The balancer can only ADD bots. There's no way to pull one out of a running
+  match, so if humans leave and your bots are now the surplus, that resolves
+  itself at the next round, not immediately.
+
+
+-------------------------------------------------------------------------------
+ 4b. ENVIRONMENT VARIABLES  (all optional except the token)
+-------------------------------------------------------------------------------
+
+  Everything here goes in .env. None of it is needed to play except TW_AUTH_1.
+  Remember: class / skin / lane / item are NOT here — they're the LOADOUT block
+  in thronebot.ts (section 7).
+
+  IDENTITY
+    TW_AUTH_1           REQUIRED. Your agent token. "Bearer x" or bare "x".
+    TW_NAME_1           The account's display name. Recommended, not required —
+                        without it the bot reads its name back out of the game
+                        state after joining.
+    TW_AUTH_2, TW_NAME_2, ...   One pair per bot for multi-bot runs. Bot #n
+                        uses TW_AUTH_n / TW_NAME_n.
+
+  BALANCER
+    TW_BALANCE_WAIT     Milliseconds to wait before filling an empty slot
+                        (default 20000). Raise it to give humans longer.
+    TW_BALANCE_KEEP=1   Balancer bots stay for good instead of retiring at the
+                        end of the round.
+
+  ROOMS
+    TW_ROOM             Pin a room (same as -room N).
+    TW_ROOMS_PATH       Path of the room-list endpoint, if the dev moves it
+                        from /api/rooms. e.g. TW_ROOMS_PATH=/api/lobby
+    TW_ROOM_SCAN        How many rooms the last-resort sweep covers
+                        (default 64). Only used if the room list is gone.
+
+  MULTI-BOT
+    TW_INSTANCES        How many bots to launch. -amount N is the same thing
+                        and wins if both are set.
+    TW_JOIN_STAGGER     Milliseconds between each bot's launch (default 1500),
+                        so a party doesn't hit the server all at once.
+
+  ENDPOINTS  (skip discovery — useful if you're being rate-limited on boot)
+    TW_BASE             e.g. https://game.thronewars.gg
+    TW_WS               e.g. wss://game.thronewars.gg
+    TW_STATE_PATH       e.g. /api/game/state
+    TW_DEPLOY_PATH      e.g. /api/strategy/deployment
+
+  DEBUG
+    DEBUG=1             Verbose lane-scoring output.
+
+  Set internally by the parent process — do NOT set these yourself:
+    TW_CHILD, TW_ORACLE, TW_PARTY_ROOM, TW_PREFER_FACTION, TW_ONE_ROUND
+
+
+-------------------------------------------------------------------------------
+ 5. WHAT YOU'LL SEE IN THE TERMINAL  (log guide)
+-------------------------------------------------------------------------------
+
+  [boot] ...            The bot started. Shows the loadout and whether the
+                        token was found.
   [ws] connected ...    It reached the live 20x/sec game feed.
-  [ws] no snapshots...  The live feed is silent; the bot rotates to a backup
-                        host and KEEPS PLAYING via the normal API (REST mode).
-  [join] deploying ...  Asking the server to spawn the hero (sent ONCE).
+  [join] deploying ...  Asking the server to spawn the hero.
   [join] confirmed ...  The server shows our hero — we're officially in.
-  [schema] LIVE MODE ON The fast feed works; reactions are now ~50ms.
+  [join] loadout: ...   What we asked for vs what the server actually gave us.
+  [join] skin "x" applied         The skin took.
+  [join] skin "x" did not apply   Wrong id; it tries the next spelling next
+                        round. See section 7.
+  [id] ...              Identity/room resolution (who the server thinks we are).
+  [room] ...            We found our hero in a different room and followed it.
   [act] lane mid->top   It changed lane (old->new, with the reason).
-  [act] ability -> ...  It picked an ability level-up (shows the choices too).
-  [act] recall / sprint / stroll   It used that action (with the reason).
+  [act] ability -> ...  It picked an ability level-up (shows the offer too).
+  [act] stroll (opening ...)      The one slow-down as it enters the game.
+  [act] recall / sprint It used that action, with the reason.
   [round] over ...      The round ended; it auto-rejoins the next one.
-  [status] ...          A heartbeat every 30s: mode (LIVE or REST), lane,
-                        level, HP, recall readiness.
+  [diag] not confirmed  It can't find itself in the game — shows the roster it
+                        CAN see, which usually explains why immediately.
+  [party] ...           Multi-bot process management.
+  [balance] ...         Team-balancing decisions.
+  [status] ...          A heartbeat every 30s: mode, lane, level, HP, recall.
 
-  No [act] output for a while is normal — a warrior that isn't rotating for a
+  No [act] output for a while is normal — a hero that isn't rotating for a
   reason is standing still and attacking, which is exactly what we want.
 
 
 -------------------------------------------------------------------------------
- 5. HOW IT WORKS  (architecture, plain-English)
+ 6. HOW IT WORKS  (architecture, plain-English)
 -------------------------------------------------------------------------------
 
   The game streams the full battlefield 20 times a second over a WebSocket.
   The bot listens to that and runs TWO decision loops:
 
     - REFLEX loop (20x/sec): the ONE thing that needs instant reaction —
-      recalling the moment it's about to die. Fast path, nothing else.
+      recalling the moment it's about to die.
 
-    - MACRO loop (5x/sec): everything else, evaluated as a priority list.
-      It only ever sends ONE action per pass, and only if that action actually
-      changes something, so it never spams the server.
+    - MACRO loop (5x/sec): everything else, as a priority list. It only ever
+      sends ONE action per pass, and only if that action changes something.
 
-  Actions are sent over the WebSocket for low latency (lane switch, recall,
-  sprint, stroll). The REST endpoint is used only for the two things the socket
-  doesn't do: the first join, and picking abilities.
+  All actions go to the REST deploy endpoint: the join, lane switches, recall,
+  sprint/stroll and ability picks. They are only valid while you have a live
+  hero — which is why the bot is careful about knowing whether a round is still
+  running (see FIXES.md, addendum 4).
 
   A key rule of this game shapes everything: HEROES CANNOT MOVE BACKWARD. The
   only ways to "retreat" are Recall (teleport home) or a lane-switch "peel"
   (which also grants ~3s of aggro-immunity). The bot never tries to walk back.
 
+  MULTI-BOT: with -amount N, one parent process opens a single WebSocket and a
+  single REST poll and shares that feed with all children over IPC — N bots,
+  one connection's worth of load. If a child ends up in a different room it
+  leaves the shared feed and opens its own.
+
 
 -------------------------------------------------------------------------------
- 6. THE STRATEGY IT PLAYS  (what's baked in)
+ 7. THE LOADOUT AND STRATEGY  (what's baked in)
 -------------------------------------------------------------------------------
 
-  ABILITY BUILD (picked automatically as it levels):
-    1. Defensive Aura  -> maxed first (team-wide damage reduction, radius grows)
-    2. Cleave          -> exactly 1 level, never more
-    3. Divine Shield   -> exactly 1 level
-    4. Aura finishes maxing
-    5. Thorns          -> driven to 4 vs melee/ranged-heavy enemy teams,
-                          kept low vs mage-heavy teams (Thorns ignores spells)
-    6. Fury            -> once the core above is complete
-    (Every ability maxes at level 4.)
+  At the top of thronebot.ts:
+
+      const LOADOUT = {
+          heroClass: "mage",
+          lane: "mid",
+          skin: ["throne_of_bones", "throneofbones", "throne-of-bones", "bones"],
+          items: ["cat_ears", "ring_of_regen", null],
+      };
+
+  SKIN IS A LIST because skin ids aren't documented and a wrong one doesn't
+  fail — the server returns a happy 200 and silently ignores it. So the bot
+  checks whether the skin actually applied and tries the next spelling next
+  round if not. Once one works, that's the one it keeps using.
+
+  ITEMS ARE A LIST in preference order. Cat Ears costs 1,600 Silver; Ring of
+  Regen is free. If the account doesn't own the first, the bot falls back and
+  logs it — and because preferences reset every round, it picks up Cat Ears by
+  itself the round after you buy it. No restart needed.
+
+  ABILITY BUILD (Throne of Bones mage):
+    1. Fireball        -> 1
+    2. Tornado         -> 1
+    3. Skeleton Archer -> 1   (Fury's replacement on this skin; ahead of the
+                               plain skeleton, which it outclasses)
+    4. Raise Skeleton  -> 1
+    5. Fireball        -> maxed
+    6. Tornado         -> maxed
+    7. Fortitude       -> maxed
+    (Every ability maxes at 4. Run "npx tsx build-test.ts" to print the exact
+     pick order after any edit.)
 
   RECALL (press late, never waste it):
     It measures its own incoming damage over the last ~half second, projects it
     forward, and recalls the instant "current HP minus incoming would die" AND
-    at least one enemy HERO is within 350px (so dying would feed them 200 XP).
-    If Divine Shield is up or ready, it does NOT recall — it facetanks the hit,
-    because the shield eats it. If no enemy hero is in range, it may let itself
-    die rather than waste the 120s recall.
+    at least one enemy HERO is within 350px (so dying would feed them XP). If
+    no enemy hero is in range, it may let itself die rather than waste recall.
 
   LANES:
-    Stacks MID by default. Bails to the best side lane if mid is clearly lost,
-    restacks mid when it recovers. Rotates home to defend the nexus when it's
-    threatened by enemy heroes (recalling home if too far forward to peel).
+    Stacks mid by default. Bails to the best side lane if mid is clearly lost,
+    restacks mid when it recovers. Rotates home to defend when the nexus is
+    threatened. In multi-bot runs they naturally spread out, because each bot
+    evaluates a battlefield that has already changed by the time it acts.
 
-  SPRINT / STROLL:
-    Sprints to rush a defense or commit to an escape. Strolls to hold at its own
-    tower when isolated, waiting for allies to regroup.
+  STROLL:
+    Exactly once, on entering the game — we spawn and walk out ahead of the
+    creeps, and half speed for 5s lets the wave form up in front of us. It is
+    deliberately not used again; the 25s cooldown is worth holding.
 
 
 -------------------------------------------------------------------------------
- 7. TUNING IT  (optional — the CFG block near the top of bot.ts)
+ 8. TUNING IT  (optional — the CFG block in thronebot.ts)
 -------------------------------------------------------------------------------
 
-  Open bot.ts and look for "const CFG = {". Safe knobs to experiment with:
-
-    homeLane        Which lane to stack (default "mid").
+    homeLane        Which lane to stack.
     recallFloor     Panic HP fraction backstop (default 0.06 = 6%).
     predictLookaheadMs / dpsWindowMs   How far ahead / over what window it
                     judges incoming damage. Bigger = recalls earlier/safer.
     xpRange         Radius (px) counted as "an enemy hero is in range".
     midBailAdv      How badly it must be losing mid before it leaves.
-    spamMs          How fast it re-presses lane-switch when escaping (~1.5s).
+    spawnStrollWindowMs  How long after entering it will still bother with the
+                    opening stroll before giving up (default 12s).
 
-  Nothing here needs changing to play — these are for fine-tuning.
-
-
--------------------------------------------------------------------------------
- 8. THE [schema] LINES  (why they matter)
--------------------------------------------------------------------------------
-
-  On its first connect the bot prints a few [schema] lines describing the EXACT
-  shape of the live feed (top-level keys, a sample unit, and whether projectile
-  / zone / cooldown data is present). This is how we confirm advanced features
-  (dodging spells, tower "juke" positioning) are wired to real field names.
-  If you ever want those upgrades, copy the [schema] lines and share them.
+  Nothing here needs changing to play.
 
 
 -------------------------------------------------------------------------------
  9. RUNNING IT 24/7 ON A SERVER (VPS)
 -------------------------------------------------------------------------------
 
-  The bot is very light (well under 1% of one CPU core, ~50-80 MB RAM). Any
-  cheapest-tier Linux VPS runs it. The only thing to watch is bandwidth: the
-  feed is 20 snapshots/sec, which can be a few GB/day — fine for most plans.
+  The bot is light (well under 1% of one CPU core, ~50-80 MB RAM). Any
+  cheapest-tier Linux VPS runs it. Watch bandwidth: the feed is 20 snapshots a
+  second, a few GB/day. Multi-bot mode shares ONE feed across all bots, so 12
+  bots cost about the same bandwidth as one.
 
-    1. Register the API key once in your laptop browser (step 2b), copy the key.
-    2. On the VPS: install Node 18+, copy the files over, run "npm i", then
-       create the .env file there too (copy .env.example to .env and fill it in).
-       Send .env securely (e.g. scp) — do NOT commit it to git.
-    3. Keep it running across reboots/crashes with a process manager:
+    1. Install Node 18+, copy the files over, run "npm i".
+    2. Create .env there too. Send it securely (scp) — never commit it.
+    3. Keep it alive with a process manager:
 
          npm i -g pm2
-         pm2 start "npx tsx bot.ts" --name dota-bot
+         pm2 start "npx tsx thronebot.ts -amount 4 -balancer" --name tw-bot
          pm2 save && pm2 startup
 
-    View logs any time with:  pm2 logs dota-bot
+    View logs any time with:  pm2 logs tw-bot
 
 
 -------------------------------------------------------------------------------
- 10. WALLET & ITEMS  (fully optional)
+ 10. SILVER AND ITEMS
 -------------------------------------------------------------------------------
 
-  The bot tries items in preference order: "Cat Ears" first, then "Ring of
-  Regen" (big HP regen — turns the warrior into a tank). If the server rejects
-  or ignores one, it falls back to the next automatically and logs what
-  happened. Owning items normally requires your account/wallet to own them:
+  Silver is earned by playing RANKED: +40 for finishing a match, +40 more for
+  winning, +100 for your first win of the day, scaled by how much of the match
+  you were present for. Practice games pay nothing.
 
-    - NO CRYPTO: buy Ring of Regen with "Silver", earned just by playing human
-      ranked games (Game 1). It's then tied to your account permanently.
+  Ring of Regen and Heavy Morning Star are free. Cat Ears costs 1,600 Silver
+  and is the strongest item available — a 2-second full lockout on the nearest
+  enemy hero every 20 seconds. Blink Dagger is 2,000. Skins are 2,000, but
+  Throne of Bones is free.
 
-    - WALLET: use connect-wallet.ts to link a wallet that owns the item NFT.
-      It's a no-private-key, two-step flow (it prints a message, you sign it in
-      your own wallet, then submit the signature). USE A DEDICATED/BURNER WALLET.
-      Full instructions are in the comments at the top of connect-wallet.ts.
-
-  If you own neither, the bot still plays fine — it just runs without the item.
+  Each bot is its own account and earns its own Silver. Buy items in a browser
+  logged in as that bot; the bot picks up a newly-bought item automatically on
+  the next round.
 
 
 -------------------------------------------------------------------------------
- 11. TROUBLESHOOTING
+ 11. TESTING CHANGES OFFLINE
 -------------------------------------------------------------------------------
 
-  "command not found: npx"      -> Node isn't installed / not on PATH. See #2a.
-  Error mentioning DOTA_API_KEY -> your .env file is missing or empty. Copy
-                                   .env.example to .env and fill in the values.
-  [rest] deploy 401             -> the API key is wrong.
-  [rest] deploy 400 ... full    -> the game is full; it will keep retrying.
-  [rest] 429 rate-limited       -> it self-throttles and backs off; harmless.
-  [ws] closed, reconnecting     -> a normal blip; it reconnects on its own.
-  Never see [ws] connected      -> the server host may be unreachable from your
-                                   network; check your internet/VPS egress.
+  mock-server.mjs is a fake server that reproduces the failure modes we've hit
+  (round rollover, wrong room, silently-ignored skin, uneven teams). Use it to
+  test an edit without joining a real game:
+
+      node mock-server.mjs &
+      TW_BASE=http://127.0.0.1:8799 TW_WS=ws://127.0.0.1:8799 \
+        TW_AUTH_1="Bearer test" TW_NAME_1="TestBot" npx tsx thronebot.ts
+
+  Its field names are invented. Never treat it as documentation of the real API.
 
 
 -------------------------------------------------------------------------------
- 12. KNOWN LIMITS / WHAT'S NEXT
+ 12. TROUBLESHOOTING
 -------------------------------------------------------------------------------
 
-  Built and working: real-time feed, world model, measured-damage recall with
-  Divine-Shield awareness, mid-stack lane macro, base defense, escape peels,
-  sprint/stroll tempo, the full ability build.
+  "command not found: npx"    -> Node isn't installed / not on PATH. See #2a.
+  [boot] token MISSING        -> .env has no TW_AUTH_1. See #3.
+  [rest] deploy 401           -> the token is wrong.
+  [rest] deploy 400 ... full  -> the game is full; it keeps retrying.
+  [rest] 429 rate-limited     -> it self-throttles and backs off; harmless.
+  [ws] closed, reconnecting   -> a normal blip; it reconnects on its own.
+  Never see [ws] connected    -> the server may be unreachable from your
+                                 network; check your internet/VPS egress.
 
-  Not yet built: fine positional "micro" — the lane-nudge juke to drop tower
-  aggro onto creeps, and proactively side-stepping fireballs/tornados. Those
-  need a movement state-machine layer, which is the natural next addition.
+  [diag] not confirmed in game (repeatedly)
+      The roster it prints is the answer. If the roster is full of strangers,
+      you're in the wrong room. If it's empty, the feed isn't reaching you. If
+      your name is there but spelled differently, the token's account has a
+      different display name than TW_NAME_1.
+
+  It joins but never picks abilities
+      Look for "[act] ability pick ... rejected". The bot cycles through the
+      known field names for a pick and locks onto whichever works, so a
+      rejection that never resolves means the API changed. Run probe.ts.
+
+  Anything genuinely strange
+      npx tsx probe.ts            (read-only; joins nothing)
+      npx tsx probe.ts --deploy   (joins once, dumps exactly what happened)
+
+  It writes probe-report.json and ws-frame.json. Those two files plus the first
+  30 lines of bot output are enough to diagnose almost anything.
 
 ===============================================================================
